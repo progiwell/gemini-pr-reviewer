@@ -186,6 +186,11 @@ _CLEAN_PROVIDER_ENV = {
     "FALLBACK_OPENAI_API_KEY": "",
     "FALLBACK_OPENAI_MODEL": "",
     "PROVIDER_ORDER": gemini_review.DEFAULT_PROVIDER_ORDER,
+    "REVIEW_MODE": "fallback",
+    "EXTRA_PROVIDERS_MODE": "fallback",
+    "MAIN_REVIEWERS": "2",
+    "INLINE_COMMENTS": "true",
+    "CONSENSUS_MAX_PROVIDERS": "3",
 }
 
 
@@ -197,6 +202,7 @@ class _MainRunnerMixin:
         side_effect_fn,
         pr_body: str = "Fixes #1",
         linked_issues: list[dict] | None = None,
+        extra_artifacts_out: dict[str, str] | None = None,
     ) -> tuple[str, str, list[dict], list[tuple[str, str]]]:
         recorded_client_kwargs: list[dict] = []
         recorded_calls: list[tuple[str, str]] = []
@@ -272,6 +278,15 @@ class _MainRunnerMixin:
 
                 output_md = Path("review_output.md").read_text(encoding="utf-8")
                 action_txt = Path("review_action.txt").read_text(encoding="utf-8")
+                if extra_artifacts_out is not None:
+                    for p in sorted(Path(".").glob("review_output_extra_*.md")):
+                        extra_artifacts_out[p.name] = p.read_text(encoding="utf-8")
+                    for p in sorted(Path(".").glob("review_payload_*.json")):
+                        extra_artifacts_out[p.name] = p.read_text(encoding="utf-8")
+                    if Path("review_outputs.json").exists():
+                        extra_artifacts_out["review_outputs.json"] = Path("review_outputs.json").read_text(
+                            encoding="utf-8"
+                        )
                 return output_md, action_txt, recorded_client_kwargs, recorded_calls
             finally:
                 os.chdir(old_cwd)
@@ -663,6 +678,253 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
         for secret in ("AIzaSyDummyTestKey999", "ghs_secret_gh", "gsk_secret_groq", "sk-or-secret-or"):
             self.assertNotIn(secret, output_md)
         self.assertIn("***", output_md)
+
+
+class TestConsensusAndParallelModes(_MainRunnerMixin, unittest.TestCase):
+    def test_consensus_mode_synthesizes_findings_and_enforces_changes_requested(self):
+        def gemini_responder(_model: str, contents: str):
+            if "# Individual AI Provider Review Findings" in contents:
+                return "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\nSynthesized findings.\n\n[APPROVED]"
+            return "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]"
+
+        seen_urls: list[str] = []
+
+        def fake_urlopen(req, timeout=60):
+            seen_urls.append(req.full_url)
+            if "models.github.ai" in req.full_url:
+                return _make_urlopen_response("Found missing edge case test.\n\n[CHANGES_REQUESTED]")
+            return _make_urlopen_response("Looks solid overall.\n\n[APPROVED]")
+
+        env = {
+            "GEMINI_MAX_RETRIES": "1",
+            "REVIEW_MODE": "consensus",
+            "CONSENSUS_MAX_PROVIDERS": "3",
+            "ENABLE_GITHUB_MODELS": "true",
+            "GH_TOKEN": "ghs_test_token",
+            "GROQ_API_KEY": "gsk_test_token",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, _, calls = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150), env, gemini_responder
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("# Individual AI Provider Review Findings", calls[1][1])
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://models.github.ai/inference/chat/completions",
+                "https://api.groq.com/openai/v1/chat/completions",
+            ],
+        )
+        self.assertIn("#### 🤝 Multi-Provider Consensus Summary", output_md)
+        self.assertIn("### AI Code Review (Consensus:", output_md)
+        self.assertIn("❌ Changes Requested", output_md)
+        self.assertEqual(action_txt, "request-changes")
+
+    def test_consensus_mode_handles_partial_provider_failure(self):
+        def gemini_responder(_model: str, _contents: str):
+            raise RuntimeError("503 UNAVAILABLE")
+
+        def fake_urlopen(_req, timeout=60):
+            return _make_urlopen_response("#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]")
+
+        env = {
+            "GEMINI_MAX_RETRIES": "1",
+            "REVIEW_MODE": "consensus",
+            "GROQ_API_KEY": "gsk_test_token",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, _, _ = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150), env, gemini_responder
+            )
+
+        self.assertIn("⚠️ Unavailable", output_md)
+        self.assertIn("**Google AI Studio**", output_md)
+        self.assertIn("✅ Approved", output_md)
+        self.assertIn("**Groq**", output_md)
+        self.assertEqual(action_txt, "approve")
+
+    def test_parallel_mode_emits_primary_and_extra_review_files(self):
+        def gemini_responder(_model: str, _contents: str):
+            return "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]"
+
+        def fake_urlopen(_req, timeout=60):
+            return _make_urlopen_response("Missing unit test coverage.\n\n[CHANGES_REQUESTED]")
+
+        artifacts: dict[str, str] = {}
+        env = {
+            "GEMINI_MAX_RETRIES": "1",
+            "REVIEW_MODE": "parallel",
+            "GROQ_API_KEY": "gsk_test_token",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, _, _ = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150),
+                env,
+                gemini_responder,
+                extra_artifacts_out=artifacts,
+            )
+
+        self.assertEqual(action_txt, "request-changes")
+        self.assertIn("### AI Code Review (gemini-3.8-flash via Google AI Studio)", output_md)
+        self.assertIn("review_output_extra_1.md", artifacts)
+        self.assertIn("### AI Code Review (openai/gpt-oss-120b via Groq)", artifacts["review_output_extra_1.md"])
+        self.assertIn("Missing unit test coverage.", artifacts["review_output_extra_1.md"])
+        self.assertIn("review_outputs.json", artifacts)
+        meta = json.loads(artifacts["review_outputs.json"])
+        self.assertEqual([item["provider_id"] for item in meta], ["gemini", "groq"])
+        self.assertEqual([item["action"] for item in meta], ["approve", "request-changes"])
+
+
+class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.TestCase):
+    def test_two_main_reviewers_with_third_provider_as_fallback(self):
+        def gemini_responder(_model: str, _contents: str):
+            return "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]"
+
+        seen_urls: list[str] = []
+
+        def fake_urlopen(req, timeout=60):
+            seen_urls.append(req.full_url)
+            if "models.github.ai" in req.full_url:
+                raise _make_http_error(req.full_url, 429, b"Rate limit exceeded")
+            if "api.groq.com" in req.full_url:
+                return _make_urlopen_response("Needs null check.\n\n[CHANGES_REQUESTED]")
+            raise AssertionError(f"Unexpected 4th provider call to {req.full_url}")
+
+        artifacts: dict[str, str] = {}
+        env = {
+            "GEMINI_MAX_RETRIES": "1",
+            "MAIN_REVIEWERS": "2",
+            "EXTRA_PROVIDERS_MODE": "fallback",
+            "ENABLE_GITHUB_MODELS": "true",
+            "GH_TOKEN": "ghs_test_token",
+            "GROQ_API_KEY": "gsk_test_token",
+            "OPENROUTER_API_KEY": "sk-or-unused-reserve",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, _, _ = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150),
+                env,
+                gemini_responder,
+                extra_artifacts_out=artifacts,
+            )
+
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://models.github.ai/inference/chat/completions",
+                "https://api.groq.com/openai/v1/chat/completions",
+            ],
+        )
+        self.assertEqual(action_txt, "request-changes")
+        self.assertIn("**Reviewer:** `Main Reviewer #1`", output_md)
+        self.assertIn("**Source Provider:** `Google AI Studio`", output_md)
+        self.assertIn("**AI Model:** `gemini-3.8-flash`", output_md)
+
+        extra_md = artifacts["review_output_extra_1.md"]
+        self.assertIn("**Reviewer:** `Main Reviewer #2`", extra_md)
+        self.assertIn("**Source Provider:** `Groq`", extra_md)
+        self.assertIn("**AI Model:** `openai/gpt-oss-120b`", extra_md)
+        self.assertIn("**Fallback For:** `GitHub Models`", extra_md)
+
+    def test_two_main_reviewers_with_extra_providers_as_subagents(self):
+        gemini_prompts: list[str] = []
+
+        def gemini_responder(_model: str, contents: str):
+            gemini_prompts.append(contents)
+            return "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]"
+
+        gh_prompts: list[str] = []
+
+        def fake_urlopen(req, timeout=60):
+            payload = json.loads(req.data.decode("utf-8"))
+            user_msg = payload["messages"][1]["content"]
+            if "api.groq.com" in req.full_url:
+                return _make_urlopen_response("Subagent found potential SQL injection at app.py:L1.")
+            if "models.github.ai" in req.full_url:
+                gh_prompts.append(user_msg)
+                return _make_urlopen_response("Verified SQL injection.\n\n[CHANGES_REQUESTED]")
+            raise AssertionError(f"Unexpected call to {req.full_url}")
+
+        artifacts: dict[str, str] = {}
+        env = {
+            "GEMINI_MAX_RETRIES": "1",
+            "MAIN_REVIEWERS": "2",
+            "EXTRA_PROVIDERS_MODE": "subagents",
+            "ENABLE_GITHUB_MODELS": "true",
+            "GH_TOKEN": "ghs_test_token",
+            "GROQ_API_KEY": "gsk_test_token",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, _, _ = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150),
+                env,
+                gemini_responder,
+                extra_artifacts_out=artifacts,
+            )
+
+        self.assertEqual(action_txt, "request-changes")
+        self.assertIn("# Subagent Reviewer Reports", gemini_prompts[0])
+        self.assertIn("Subagent found potential SQL injection at app.py:L1.", gemini_prompts[0])
+        self.assertIn("# Subagent Reviewer Reports", gh_prompts[0])
+        self.assertIn("**Subagents Consulted:** `openai/gpt-oss-120b via Groq`", output_md)
+        self.assertIn("**Subagents Consulted:** `openai/gpt-oss-120b via Groq`", artifacts["review_output_extra_1.md"])
+
+    def test_inline_line_by_line_comments_annotated_extracted_and_attributed(self):
+        diff_text = (
+            "diff --git a/src/auth.py b/src/auth.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/src/auth.py\n"
+            "+++ b/src/auth.py\n"
+            "@@ -10,3 +10,4 @@ def login(user):\n"
+            " def get_user(cursor, user_id):\n"
+            "-    return cursor.execute('SELECT * FROM users')\n"
+            "+    query = f'SELECT * FROM users WHERE id = {user_id}'\n"
+            "+    return cursor.execute(query)\n"
+        )
+        annotated, valid_lines = gemini_review.annotate_diff_with_line_numbers(
+            gemini_review.parse_diff_files(diff_text)
+        )
+        self.assertEqual(valid_lines["src/auth.py"], {10, 11, 12})
+        self.assertIn("[L11] +    query = f'SELECT * FROM users WHERE id = {user_id}'", annotated[0][1])
+
+        def gemini_responder(_model: str, contents: str):
+            self.assertIn("[L11] +    query =", contents)
+            return (
+                "#### 📋 Issue Requirements Checklist\n- ❌ SQL injection vulnerability\n\n"
+                "#### 📍 Line-by-Line Findings\n- `src/auth.py:L11`: Unparameterized SQL query.\n\n"
+                "```json:inline-comments\n"
+                '[\n'
+                '  {"path": "src/auth.py", "line": 11, "severity": "error", "comment": "Use parameterized query.", "suggestion": "    return cursor.execute(\\"SELECT * FROM users WHERE id = ?\\", (user_id,))"},\n'
+                '  {"path": "src/other.py", "line": 99, "severity": "warning", "comment": "Unanchored note."}\n'
+                ']\n'
+                "```\n\n"
+                "[CHANGES_REQUESTED]"
+            )
+
+        artifacts: dict[str, str] = {}
+        output_md, action_txt, _, _ = self._run_main_in_tempdir(
+            diff_text,
+            {"INLINE_COMMENTS": "true"},
+            gemini_responder,
+            extra_artifacts_out=artifacts,
+        )
+
+        self.assertEqual(action_txt, "request-changes")
+        self.assertNotIn("```json:inline-comments", output_md)
+        self.assertIn("#### 📌 Additional Line Notes", output_md)
+        self.assertIn("**src/other.py:L99** (WARNING): Unanchored note.", output_md)
+
+        payload = json.loads(artifacts["review_payload_1.json"])
+        self.assertEqual(payload["event"], "REQUEST_CHANGES")
+        self.assertEqual(len(payload["comments"]), 1)
+        c = payload["comments"][0]
+        self.assertEqual(c["path"], "src/auth.py")
+        self.assertEqual(c["line"], 11)
+        self.assertEqual(c["side"], "RIGHT")
+        self.assertIn("🤖 **Main Reviewer #1** (`gemini-3.8-flash` via **Google AI Studio**) · `ERROR`", c["body"])
+        self.assertIn("```suggestion", c["body"])
 
 
 if __name__ == "__main__":

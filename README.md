@@ -42,22 +42,46 @@ jobs:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
 ```
 
-### Customizing the Fallback Chain & Cross-Provider Backup (Optional)
+### Built-In Free AI Providers, 2-Reviewer Default & Line-by-Line Comments
 
-You can pass a comma-separated list to `fallback-model` (for example, adding `gemini-2.5-flash`), exclude additional generated paths, or configure an OpenAI-compatible cross-provider backup (such as **Groq** or **OpenRouter `:free`**):
+You can combine Google Gemini with built-in free AI provider presets (**GitHub Models**, **Groq**, **OpenRouter `:free`**, **Cerebras**, and **Mistral**) using simple inputs:
+
+- **`main-reviewers` (default `'2'`)**: Selects the first 2 working providers in `provider-order` as **Main Reviewer #1** and **Main Reviewer #2**, each posting an attributed review labeled with its reviewer slot, source provider, AI model, and any fallback/subagent provenance.
+- **`extra-providers-mode` (default `'fallback'`)**:
+  - `'fallback'` *(default)*: Providers beyond the first 2 working main reviewers stay in reserve and only run if a main reviewer fails (`429`/`503`/timeout).
+  - `'subagents'` *(or `review-mode: 'subagents'`)*: Extra providers (3+) run first as **Subagent Reviewers** and report their `path:L<line>` findings back to the 2 Main Reviewers.
+- **`inline-comments` (default `'true'`)**: Annotates diff lines with exact `[L<n>]` line numbers, extracts structured findings, and posts line-by-line GitHub PR diff comments (with optional ```` ```suggestion ```` blocks) attributed to the exact reviewer slot, model, and provider.
+- **`review-mode`**: Choose `'fallback'` *(default, up to `main-reviewers` reviews with reserve fallbacks)*, `'subagents'`, `'consensus'` *(synthesizes up to `consensus-max-providers` into one review with a consensus table)*, or `'parallel'` *(runs every enabled provider independently)*.
+
+#### Example: 2 Main Reviewers + Free Fallbacks/Subagents + Line-by-Line Reviews
 
 ```yaml
-      - name: Gemini AI Review
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+      models: read   # Required only when enable-github-models is 'true'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Multi-Provider AI Review
         uses: progiwell/gemini-pr-reviewer@v1
         with:
-          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
-          primary-model: 'gemini-3.8-flash'
-          fallback-model: 'gemini-3.6-flash,gemini-3.5-flash-lite,gemini-2.5-flash'
-          request-timeout: '60'
+          main-reviewers: '2'              # Default: 2 independent main reviewers
+          extra-providers-mode: 'fallback' # 'fallback' (default) or 'subagents'
+          inline-comments: 'true'          # Default: exact line-by-line diff comments
+          provider-order: 'gemini,github-models,groq,openrouter,cerebras,mistral'
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }} # optional if another provider is enabled
+          enable-github-models: 'true'                  # uses GITHUB_TOKEN (zero extra secret)
+          groq-api-key: ${{ secrets.GROQ_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          cerebras-api-key: ${{ secrets.CEREBRAS_API_KEY }}
+          mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
           exclude-paths: '*.pb.ts,docs/generated/*'
-          fallback-openai-base-url: 'https://api.groq.com/openai/v1'
-          fallback-openai-api-key: ${{ secrets.GROQ_API_KEY }}
-          fallback-openai-model: 'openai/gpt-oss-120b'
 ```
 
 ---
@@ -81,17 +105,33 @@ The reviewer automatically detects linked issues from any of the following forma
 
 | Input | Description | Default | Required |
 |---|---|---|---|
-| `gemini-api-key` | Google AI Studio Gemini API Key | N/A | **Yes** |
-| `github-token` | GitHub Token for fetching issues & posting reviews | `${{ github.token }}` | No |
-| `primary-model` | Primary model to query | `gemini-3.8-flash` | No |
-| `fallback-model` | Fallback model(s) to try in order when primary is congested (comma-separated) | `gemini-3.6-flash,gemini-3.5-flash-lite` | No |
-| `max-retries` | Max retry attempts per model before failing over (capped at 2 when a fallback chain is configured) | `1` | No |
+| `gemini-api-key` | Google AI Studio Gemini API Key (optional if another provider is enabled) | `''` | No |
+| `github-token` | GitHub Token for fetching issues, posting reviews, and GitHub Models | `${{ github.token }}` | No |
+| `main-reviewers` | Number of primary AI reviewers to run on each PR | `2` | No |
+| `extra-providers-mode` | Extra providers beyond `main-reviewers`: `fallback` or `subagents` | `fallback` | No |
+| `inline-comments` | Enable exact line-by-line inline PR diff review comments | `true` | No |
+| `review-mode` | Multi-provider mode: `fallback`, `subagents`, `consensus`, or `parallel` | `fallback` | No |
+| `consensus-max-providers` | Max number of enabled providers queried in `consensus` mode | `3` | No |
+| `provider-order` | Comma-separated priority order across enabled AI providers | `gemini,github-models,groq,openrouter,cerebras,mistral,custom-openai` | No |
+| `primary-model` | Primary Gemini model to query | `gemini-3.8-flash` | No |
+| `fallback-model` | Fallback Gemini model(s) when primary is congested (comma-separated) | `gemini-3.6-flash,gemini-3.5-flash-lite` | No |
+| `enable-github-models` | Enable GitHub Models free tier via `github-token` (`models: read`) | `false` | No |
+| `github-models-model` | Model(s) for GitHub Models provider (comma-separated) | `openai/gpt-4.1-mini` | No |
+| `groq-api-key` | Optional Groq API key for free-tier review/fallback | `''` | No |
+| `groq-model` | Model(s) for Groq provider (comma-separated) | `openai/gpt-oss-120b,llama-3.3-70b-versatile` | No |
+| `openrouter-api-key` | Optional OpenRouter API key for `:free` models | `''` | No |
+| `openrouter-model` | Model(s) for OpenRouter provider (comma-separated) | `qwen/qwen3-coder:free,deepseek/deepseek-r1:free` | No |
+| `cerebras-api-key` | Optional Cerebras API key | `''` | No |
+| `cerebras-model` | Model(s) for Cerebras provider (comma-separated) | `llama-3.3-70b` | No |
+| `mistral-api-key` | Optional Mistral API key | `''` | No |
+| `mistral-model` | Model(s) for Mistral provider (comma-separated) | `codestral-latest` | No |
+| `max-retries` | Max retry attempts per model before failing over (capped at 2 when multiple candidates exist) | `1` | No |
 | `retry-delay` | Base backoff delay in seconds | `10` | No |
 | `request-timeout` | HTTP timeout in seconds per API request | `60` | No |
 | `exclude-paths` | Optional comma-separated extra glob patterns to exclude from diff review | `''` | No |
 | `fallback-openai-base-url` | Optional OpenAI-compatible API base URL for cross-provider fallback | `''` | No |
-| `fallback-openai-api-key` | Optional API key for OpenAI-compatible fallback | `''` | No |
-| `fallback-openai-model` | Optional model name for OpenAI-compatible fallback | `''` | No |
+| `fallback-openai-api-key` | Optional API key for the OpenAI-compatible fallback | `''` | No |
+| `fallback-openai-model` | Optional model name(s) for the OpenAI-compatible fallback | `''` | No |
 | `pr-size-warn-lines` | Changed source line threshold for PR size warning callout | `800` | No |
 | `pr-size-warn-files` | Changed source file count threshold for PR size warning callout | `12` | No |
 | `python-version` | Python runtime version | `3.11` | No |
@@ -106,8 +146,8 @@ The reviewer automatically detects linked issues from any of the following forma
    - Audits the code diff directly against the **original issue specification**—not just the PR description—catching cases where a developer or coding agent misinterpreted the issue.
    - Generates a structured **📋 Issue Requirements Checklist** verifying every requirement and acceptance criterion (`✅ Implemented`, `⚠️ Partial`, `❌ Missing / Misinterpreted`).
    - **Strict Linking Policy**: If no issue is linked, the reviewer requests changes (`[CHANGES_REQUESTED]`) and reminds the developer to link the issue. If the issue is still not linked after 2 reviews, the reviewer shares the `BYPASS-LINK-ISSUE` keyword for legitimate issue-less PRs (e.g., quick chores or hotfixes).
-2. **3-Tier Multi-Model & Cross-Provider Fallback**:
-   Supports a comma-separated Gemini fallback list (`gemini-3.8-flash` $\to$ `gemini-3.6-flash` $\to$ `gemini-3.5-flash-lite`) plus an optional stdlib OpenAI-compatible last-resort backup (`fallback-openai-*` for Groq, OpenRouter, etc.). Unknown/deprecated (`404`) models fail over immediately; fatal auth errors (`401`/`403`) abort immediately with dual-key-scrubbed logs.
+2. **2 Main Reviewers + Fallbacks/Subagents + Line-by-Line Inline Comments**:
+   Supports Google Gemini (`gemini-3.8-flash` $\to$ `gemini-3.6-flash` $\to$ `gemini-3.5-flash-lite`) alongside built-in stdlib presets for **GitHub Models** (via `GITHUB_TOKEN`), **Groq**, **OpenRouter `:free`**, **Cerebras**, **Mistral**, and custom OpenAI-compatible endpoints (`fallback-openai-*`). Defaults to **2 independent Main Reviewers** with remaining providers held as automatic fallbacks (`extra-providers-mode: 'fallback'`) or consulted first as subagents (`extra-providers-mode: 'subagents'`), plus exact `[L<n>]` line-by-line PR diff comments (`inline-comments: 'true'`) clearly attributed by reviewer slot, source provider, and AI model. Unknown/deprecated (`404`) models fail over immediately; fatal auth errors (`401`/`403`) scrub all configured secrets from logs.
 3. **Client Timeout & Socket-Drop Resilience**:
    Enforces an explicit HTTP request timeout (`request-timeout`, default `60s`), treats socket disconnects (`Server disconnected`), connection resets, and timeouts as transient retryable errors, and logs exact sanitized API errors (`503` vs `429` vs timeout) instead of hanging indefinitely.
 4. **Smart Diff Filtering, PR Size Callouts & File-Aware Chunked Review**:

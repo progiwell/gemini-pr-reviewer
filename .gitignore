@@ -4,6 +4,8 @@ __pycache__/
 pr_diff.txt
 pr_diff_stat.txt
 review_output.md
+review_output_extra_*.md
+review_payload_*.json
 review_action.txt
 review_outputs.json
 .worktrees/

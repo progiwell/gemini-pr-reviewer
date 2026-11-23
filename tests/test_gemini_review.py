@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -349,6 +352,137 @@ class TestMainEndToEnd(unittest.TestCase):
         self.assertEqual(action_txt, "request-changes")
         self.assertIn("No Linked GitHub Issue Found", output_md)
         self.assertIn("[CHANGES_REQUESTED]", output_md)
+
+    def test_fast_failover_with_max_retries_one_has_zero_sleeps(self):
+        def responder(model: str, _contents: str):
+            if model in ("gemini-3.8-flash", "gemini-3.6-flash"):
+                raise RuntimeError("503 UNAVAILABLE")
+            return "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]"
+
+        output_md, action_txt, _, calls = self._run_main_in_tempdir(
+            _make_file_patch("app.py", 150),
+            {"GEMINI_MAX_RETRIES": "1"},
+            responder,
+        )
+        self.assertEqual(
+            [m for m, _ in calls],
+            ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"],
+        )
+        self._last_sleep_mock.assert_not_called()
+        self.assertEqual(action_txt, "approve")
+        self.assertIn("> **PR Size:** `S`", output_md)
+
+    def test_openai_compatible_fallback_succeeds_when_gemini_fails(self):
+        def responder(_model: str, _contents: str):
+            raise RuntimeError("503 UNAVAILABLE")
+
+        fake_body = json.dumps(
+            {
+                "choices": [
+                    {"message": {"content": "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]"}}
+                ]
+            }
+        ).encode("utf-8")
+
+        fake_resp = mock.MagicMock()
+        fake_resp.read.return_value = fake_body
+        fake_resp.__enter__.return_value = fake_resp
+        fake_resp.__exit__.return_value = False
+
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", return_value=fake_resp) as urlopen_mock:
+            output_md, action_txt, _, calls = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150),
+                {
+                    "GEMINI_MAX_RETRIES": "1",
+                    "FALLBACK_OPENAI_BASE_URL": "https://api.groq.com/openai/v1",
+                    "FALLBACK_OPENAI_API_KEY": "gsk_secret_fallback_token",
+                    "FALLBACK_OPENAI_MODEL": "openai/gpt-oss-120b",
+                },
+                responder,
+            )
+
+        self.assertEqual(len(calls), 3)
+        urlopen_mock.assert_called_once()
+        req = urlopen_mock.call_args[0][0]
+        self.assertEqual(req.full_url, "https://api.groq.com/openai/v1/chat/completions")
+        self.assertEqual(action_txt, "approve")
+        self.assertIn("### AI Code Review (openai/gpt-oss-120b (OpenAI-compatible fallback))", output_md)
+        self.assertNotIn("via Google AI Studio", output_md)
+
+    def test_openai_compatible_fallback_http_error_scrubs_both_keys(self):
+        def responder(_model: str, _contents: str):
+            raise RuntimeError("503 UNAVAILABLE")
+
+        http_err = urllib.error.HTTPError(
+            url="https://api.groq.com/openai/v1/chat/completions",
+            code=401,
+            msg="Unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(b"Invalid key gsk_secret_fallback_token and AIzaSyDummyTestKey999"),
+        )
+
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=http_err):
+            output_md, action_txt, _, _ = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150),
+                {
+                    "GEMINI_MAX_RETRIES": "1",
+                    "FALLBACK_OPENAI_BASE_URL": "https://api.groq.com/openai/v1",
+                    "FALLBACK_OPENAI_API_KEY": "gsk_secret_fallback_token",
+                    "FALLBACK_OPENAI_MODEL": "openai/gpt-oss-120b",
+                },
+                responder,
+            )
+
+        self.assertEqual(action_txt, "comment")
+        self.assertNotIn("gsk_secret_fallback_token", output_md)
+        self.assertNotIn("AIzaSyDummyTestKey999", output_md)
+        self.assertIn("***", output_md)
+
+
+class TestPRSizeCallout(unittest.TestCase):
+    @staticmethod
+    def _multiline_patch(path: str, added_lines: int, deleted_mode: bool = False) -> str:
+        mode_line = "deleted file mode 100644\n" if deleted_mode else "new file mode 100644\n"
+        sign = "-" if deleted_mode else "+"
+        body = "\n".join(f"{sign}line {i}" for i in range(added_lines))
+        return (
+            f"diff --git a/{path} b/{path}\n"
+            f"{mode_line}"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            f"@@ -1,{added_lines} +1,{added_lines} @@\n"
+            f"{body}"
+        )
+
+    def test_compute_stats_and_classification(self):
+        kept = [
+            ("src/a.py", self._multiline_patch("src/a.py", 120)),
+            ("src/b.py", self._multiline_patch("src/b.py", 100)),
+        ]
+        adds, dels = gemini_review.compute_diff_line_stats(kept)
+        self.assertEqual((adds, dels), (220, 0))
+        self.assertEqual(gemini_review.classify_pr_size(50, 2), "S")
+        self.assertEqual(gemini_review.classify_pr_size(220, 2), "M")
+        self.assertEqual(gemini_review.classify_pr_size(650, 3), "L")
+        self.assertEqual(gemini_review.classify_pr_size(850, 3), "XL")
+        self.assertEqual(gemini_review.classify_pr_size(100, 15), "XL")
+
+    def test_callout_warns_on_xl_and_added_compiled_artifacts_only(self):
+        xl_kept = [("src/big.py", self._multiline_patch("src/big.py", 850))]
+        added_dist = [("static/dist/dashboard.js", self._multiline_patch("static/dist/dashboard.js", 50))]
+        xl_callout = gemini_review.build_pr_size_callout(xl_kept, added_dist, warn_lines=800, warn_files=12)
+        self.assertIn("> [!NOTE]", xl_callout)
+        self.assertIn("`XL`", xl_callout)
+        self.assertIn("static/dist/dashboard.js", xl_callout)
+
+        small_kept = [("Dockerfile", self._multiline_patch("Dockerfile", 10))]
+        deleted_dist = [
+            ("static/dist/dashboard.js", self._multiline_patch("static/dist/dashboard.js", 50, deleted_mode=True))
+        ]
+        delete_callout = gemini_review.build_pr_size_callout(small_kept, deleted_dist, warn_lines=800, warn_files=12)
+        self.assertNotIn("> [!NOTE]", delete_callout)
+        self.assertNotIn("Compiled/bundled artifact", delete_callout)
+        self.assertIn("> **PR Size:** `S`", delete_callout)
 
 
 if __name__ == "__main__":

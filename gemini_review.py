@@ -8,6 +8,10 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -52,6 +56,20 @@ DEFAULT_EXCLUDE_PATTERNS = (
     "*/vendor/*",
     "node_modules/*",
     "*/node_modules/*",
+)
+
+COMPILED_ARTIFACT_PATTERNS = (
+    "*.min.js",
+    "*.min.css",
+    "*.bundle.js",
+    "dist/*",
+    "*/dist/*",
+    "build/*",
+    "*/build/*",
+    ".next/*",
+    "*/.next/*",
+    "out/*",
+    "*/out/*",
 )
 
 FATAL_AUTH_INDICATORS = (
@@ -110,11 +128,12 @@ TRANSIENT_ERROR_INDICATORS = (
 )
 
 
-def sanitize_error(err_str: str, api_key: str = "") -> str:
-    """Scrubs API keys and normalizes error messages for safe logging."""
+def sanitize_error(err_str: str, *secrets: str) -> str:
+    """Scrubs API keys/secrets and normalizes error messages for safe logging."""
     cleaned = str(err_str or "")
-    if api_key:
-        cleaned = cleaned.replace(api_key, "***")
+    for secret in secrets:
+        if secret:
+            cleaned = cleaned.replace(secret, "***")
     cleaned = " ".join(cleaned.split())
     if len(cleaned) > 240:
         cleaned = cleaned[:237] + "..."
@@ -446,20 +465,102 @@ def parse_exclude_patterns(raw_patterns: str) -> list[str]:
     return [pat.strip() for pat in str(raw_patterns or "").split(",") if pat.strip()]
 
 
+def _matches_any_pattern(filepath: str, patterns: tuple[str, ...] | list[str]) -> bool:
+    """Checks if a normalized filepath or its basename matches any glob pattern."""
+    norm = filepath.replace("\\", "/").lstrip("./").lower()
+    basename = posixpath.basename(norm)
+    return any(
+        fnmatch.fnmatch(norm, pat.lower()) or fnmatch.fnmatch(basename, pat.lower())
+        for pat in patterns
+    )
+
+
 def should_exclude_path(filepath: str, extra_patterns: list[str]) -> bool:
     """Checks whether a changed filepath should be excluded from LLM diff review."""
-    norm = filepath.replace("\\", "/").lstrip("./")
-    lowered = norm.lower()
-    basename = posixpath.basename(lowered)
-
-    if basename in DEFAULT_EXCLUDE_BASENAMES:
+    norm = filepath.replace("\\", "/").lstrip("./").lower()
+    if posixpath.basename(norm) in DEFAULT_EXCLUDE_BASENAMES:
         return True
+    return _matches_any_pattern(filepath, (*DEFAULT_EXCLUDE_PATTERNS, *extra_patterns))
 
-    for pat in (*DEFAULT_EXCLUDE_PATTERNS, *extra_patterns):
-        pat_lower = pat.lower()
-        if fnmatch.fnmatch(lowered, pat_lower) or fnmatch.fnmatch(basename, pat_lower):
-            return True
-    return False
+
+def is_compiled_artifact_path(filepath: str) -> bool:
+    """Checks whether a filepath matches typical compiled/bundled frontend artifact paths."""
+    return _matches_any_pattern(filepath, COMPILED_ARTIFACT_PATTERNS)
+
+
+def is_compiled_artifact_added_or_modified(filepath: str, patch: str) -> bool:
+    """Returns True only when a compiled artifact is added or modified (not deleted)."""
+    if not is_compiled_artifact_path(filepath):
+        return False
+    return re.search(r"^deleted file mode ", patch, re.MULTILINE) is None
+
+
+def compute_diff_line_stats(files: list[tuple[str, str]]) -> tuple[int, int]:
+    """Counts added and deleted lines across unified diff patches."""
+    additions = 0
+    deletions = 0
+    for _, patch in files:
+        for line in patch.splitlines():
+            if line.startswith("+") and not line.startswith("+++ "):
+                additions += 1
+            elif line.startswith("-") and not line.startswith("--- "):
+                deletions += 1
+    return additions, deletions
+
+
+def classify_pr_size(
+    changed_lines: int, file_count: int, warn_lines: int = 800, warn_files: int = 12
+) -> str:
+    """Classifies PR diff size as S, M, L, or XL."""
+    if changed_lines > warn_lines or file_count > warn_files:
+        return "XL"
+    if changed_lines > 600 or file_count > 10:
+        return "L"
+    if changed_lines > 200 or file_count > 4:
+        return "M"
+    return "S"
+
+
+def build_pr_size_callout(
+    kept_files: list[tuple[str, str]],
+    excluded_files: list[tuple[str, str]],
+    warn_lines: int = 800,
+    warn_files: int = 12,
+) -> str:
+    """Builds a compact PR size badge or warning callout for oversized/bundled diffs."""
+    additions, deletions = compute_diff_line_stats(kept_files)
+    changed_lines = additions + deletions
+    file_count = len(kept_files)
+    size_label = classify_pr_size(changed_lines, file_count, warn_lines, warn_files)
+
+    compiled_artifacts = [
+        path
+        for path, patch in (*kept_files, *excluded_files)
+        if is_compiled_artifact_added_or_modified(path, patch)
+    ]
+
+    summary_line = (
+        f"> **PR Size:** `{size_label}` "
+        f"(+{additions:,}/-{deletions:,} lines across {file_count} source file(s))"
+    )
+    if size_label != "XL" and not compiled_artifacts:
+        return summary_line
+
+    notes: list[str] = ["> [!NOTE]", summary_line]
+    if size_label == "XL":
+        notes.append(
+            f"> - Diff exceeds the recommended threshold (>{warn_lines:,} changed source lines "
+            f"or >{warn_files} files). Consider breaking future large changes into smaller, "
+            f"focused PRs for faster human and AI review."
+        )
+    if compiled_artifacts:
+        shown = ", ".join(f"`{p}`" for p in compiled_artifacts[:5])
+        extra = f" (+{len(compiled_artifacts) - 5} more)" if len(compiled_artifacts) > 5 else ""
+        notes.append(
+            f"> - Compiled/bundled artifact(s) modified ({shown}{extra}). "
+            f"Consider gitignoring build outputs and generating them in CI/Docker."
+        )
+    return "\n".join(notes)
 
 
 def parse_diff_files(diff_content: str) -> list[tuple[str, str]]:
@@ -587,6 +688,69 @@ def attempt_review(client: genai.Client, model: str, prompt: str, system_instruc
     return response.text or "No review generated."
 
 
+@dataclass(frozen=True)
+class OpenAIFallbackConfig:
+    """Configuration for optional OpenAI-compatible cross-provider PR review fallback."""
+
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url.strip() and self.api_key.strip() and self.model.strip())
+
+
+def attempt_openai_compatible_review(
+    cfg: OpenAIFallbackConfig, prompt: str, system_instruction: str, timeout_sec: int
+) -> str:
+    """Calls an OpenAI-compatible chat completions endpoint via Python stdlib HTTP."""
+    base = cfg.base_url.strip().rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"Invalid OpenAI-compatible base URL: {cfg.base_url!r}")
+
+    endpoint = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    payload = json.dumps(
+        {
+            "model": cfg.model.strip(),
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg.api_key.strip()}",
+            "User-Agent": "gemini-pr-reviewer/1.2",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw_body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = str(e)
+        raise RuntimeError(f"HTTP {e.code} from OpenAI-compatible fallback: {err_body}") from e
+
+    data = json.loads(raw_body)
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        raise RuntimeError("OpenAI-compatible fallback returned no choices.")
+    content = ((choices[0].get("message") or {}).get("content") or "").strip()
+    return content or "No review generated."
+
+
 def invoke_with_fallback(
     client: genai.Client,
     candidate_models: list[str],
@@ -595,30 +759,37 @@ def invoke_with_fallback(
     max_retries: int,
     base_delay: int,
     api_key: str = "",
+    request_timeout_sec: int = 60,
+    openai_fallback: OpenAIFallbackConfig | None = None,
 ) -> tuple[str | None, str, str]:
-    """Invokes candidate Gemini models in order with bounded retries and fast failover."""
+    """Invokes candidate Gemini models in order, then optional OpenAI-compatible fallback."""
     per_model_attempts = (
         max(1, min(2, max_retries)) if len(candidate_models) > 1 else max(1, max_retries)
     )
     used_model = candidate_models[0]
     last_err = ""
+    extra_secrets = (openai_fallback.api_key,) if openai_fallback and openai_fallback.api_key else ()
 
     for model_idx, current_model in enumerate(candidate_models):
         used_model = current_model
         print(f"Attempting review with model: {current_model}")
 
+        fatal_auth = False
         for attempt in range(1, per_model_attempts + 1):
             print(f"[{attempt}/{per_model_attempts}] Sending review request to {current_model} via Google AI Studio...")
             try:
                 text = attempt_review(client, current_model, prompt, system_instruction)
                 return text, current_model, ""
             except Exception as e:
-                sanitized = sanitize_error(str(e), api_key)
+                sanitized = sanitize_error(str(e), api_key, *extra_secrets)
                 last_err = sanitized
 
                 if is_fatal_auth_error(sanitized):
                     print(f"Fatal authentication/permission error on {current_model}: {sanitized}")
-                    return None, current_model, sanitized
+                    if not (openai_fallback and openai_fallback.enabled):
+                        return None, current_model, sanitized
+                    fatal_auth = True
+                    break
 
                 if is_model_unavailable_error(sanitized):
                     print(f"Model {current_model} unavailable ({sanitized}). Failing over immediately...")
@@ -638,8 +809,26 @@ def invoke_with_fallback(
                     print(f"Non-transient error on {current_model} ({sanitized}).")
                     break
 
+        if fatal_auth:
+            break
         if model_idx < len(candidate_models) - 1:
             print(f"Switching to fallback model: {candidate_models[model_idx + 1]}...")
+
+    if openai_fallback and openai_fallback.enabled:
+        host = urllib.parse.urlparse(openai_fallback.base_url.strip()).netloc or "custom-endpoint"
+        print(
+            f"All Gemini models failed; trying OpenAI-compatible fallback "
+            f"({host}, model={openai_fallback.model.strip()})..."
+        )
+        try:
+            fallback_text = attempt_openai_compatible_review(
+                openai_fallback, prompt, system_instruction, request_timeout_sec
+            )
+            return fallback_text, f"{openai_fallback.model.strip()} (OpenAI-compatible fallback)", ""
+        except Exception as e:
+            sanitized_oai = sanitize_error(str(e), api_key, openai_fallback.api_key)
+            print(f"OpenAI-compatible fallback failed ({sanitized_oai}).")
+            last_err = sanitized_oai
 
     return None, used_model, last_err
 
@@ -700,6 +889,8 @@ def run_chunked_review(
     base_delay: int,
     api_key: str,
     chunk_pause: int,
+    request_timeout_sec: int = 60,
+    openai_fallback: OpenAIFallbackConfig | None = None,
 ) -> tuple[str | None, str, str]:
     """Runs Map-Reduce review across file-boundary chunks and synthesizes one final verdict."""
     chunk_system_instruction = (
@@ -741,6 +932,8 @@ def run_chunked_review(
             max_retries,
             base_delay,
             api_key=api_key,
+            request_timeout_sec=request_timeout_sec,
+            openai_fallback=openai_fallback,
         )
         last_model = chunk_model
         if chunk_text is None:
@@ -800,6 +993,8 @@ Synthesize the chunk findings below into a single coherent code review against t
         max_retries,
         base_delay,
         api_key=api_key,
+        request_timeout_sec=request_timeout_sec,
+        openai_fallback=openai_fallback,
     )
 
 
@@ -829,13 +1024,21 @@ def main():
     primary_model = os.environ.get("GEMINI_MODEL", DEFAULT_PRIMARY_MODEL)
     fallback_models_raw = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODELS)
     candidate_models = build_candidate_models(primary_model, fallback_models_raw)
-    max_retries = int(os.environ.get("GEMINI_MAX_RETRIES", "2"))
-    base_delay = int(os.environ.get("GEMINI_RETRY_DELAY", "15"))
-    request_timeout_sec = max(10, int(os.environ.get("GEMINI_REQUEST_TIMEOUT", "90")))
+    max_retries = int(os.environ.get("GEMINI_MAX_RETRIES", "1"))
+    base_delay = int(os.environ.get("GEMINI_RETRY_DELAY", "10"))
+    request_timeout_sec = max(10, int(os.environ.get("GEMINI_REQUEST_TIMEOUT", "60")))
     single_shot_max_chars = int(os.environ.get("GEMINI_SINGLE_SHOT_MAX_CHARS", "80000"))
     chunk_target_chars = int(os.environ.get("GEMINI_CHUNK_TARGET_CHARS", "45000"))
     max_chunks = max(1, int(os.environ.get("GEMINI_MAX_CHUNKS", "8")))
     chunk_pause = max(0, int(os.environ.get("GEMINI_CHUNK_PAUSE", "2")))
+    pr_size_warn_lines = max(1, int(os.environ.get("PR_SIZE_WARN_LINES", "800")))
+    pr_size_warn_files = max(1, int(os.environ.get("PR_SIZE_WARN_FILES", "12")))
+
+    openai_fallback = OpenAIFallbackConfig(
+        base_url=os.environ.get("FALLBACK_OPENAI_BASE_URL", ""),
+        api_key=os.environ.get("FALLBACK_OPENAI_API_KEY", ""),
+        model=os.environ.get("FALLBACK_OPENAI_MODEL", ""),
+    )
 
     diff_path = os.environ.get("DIFF_FILE", "pr_diff.txt")
     diff_stat_path = os.environ.get("DIFF_STAT_FILE", "pr_diff_stat.txt")
@@ -877,6 +1080,9 @@ def main():
         excluded_files = []
         excluded_only_fallback = True
 
+    pr_size_callout = build_pr_size_callout(
+        kept_files, excluded_files, warn_lines=pr_size_warn_lines, warn_files=pr_size_warn_files
+    )
     diff_overview = build_diff_overview(diff_stat_text, excluded_files)
     filtered_diff = "\n".join(patch for _, patch in kept_files)
     if excluded_only_fallback and len(filtered_diff) > single_shot_max_chars:
@@ -971,6 +1177,8 @@ def main():
             base_delay=base_delay,
             api_key=api_key,
             chunk_pause=chunk_pause,
+            request_timeout_sec=request_timeout_sec,
+            openai_fallback=openai_fallback,
         )
     else:
         overview_section = f"\n{diff_overview}\n" if diff_overview else ""
@@ -998,22 +1206,27 @@ def main():
             max_retries,
             base_delay,
             api_key=api_key,
+            request_timeout_sec=request_timeout_sec,
+            openai_fallback=openai_fallback,
         )
 
     api_succeeded = review_text is not None
     if not api_succeeded:
-        if is_fatal_auth_error(last_err):
+        if is_fatal_auth_error(last_err) and not openai_fallback.enabled:
             review_text = (
                 f"> [!WARNING]\n"
                 f"> Automated AI review failed due to authentication or permissions ({last_err}). "
                 f"Please verify `GEMINI_API_KEY` and proceed with manual review."
             )
         else:
+            tested = list(candidate_models)
+            if openai_fallback.enabled:
+                tested.append(openai_fallback.model.strip())
             err_detail = f" Last error: `{last_err}`." if last_err else ""
             review_text = (
                 f"> [!WARNING]\n"
                 f"> Automated AI review temporarily unavailable after testing "
-                f"models ({', '.join(candidate_models)}).{err_detail} Please proceed with manual review."
+                f"models ({', '.join(tested)}).{err_detail} Please proceed with manual review."
             )
 
     # Enforce strict missing-issue policy deterministically if no issue is linked and not bypassed
@@ -1031,8 +1244,13 @@ def main():
         review_action = "comment"
 
     header_suffix = f" · {chunk_count}-chunk review" if chunk_count > 1 else ""
-    header = f"### AI Code Review ({used_model} via Google AI Studio{header_suffix})\n\n"
-    write_review_outputs(header + review_text, review_action)
+    if "(OpenAI-compatible fallback)" in used_model:
+        header = f"### AI Code Review ({used_model}{header_suffix})\n\n"
+    else:
+        header = f"### AI Code Review ({used_model} via Google AI Studio{header_suffix})\n\n"
+
+    size_prefix = f"{pr_size_callout}\n\n" if pr_size_callout else ""
+    write_review_outputs(header + size_prefix + review_text, review_action)
 
 
 if __name__ == "__main__":

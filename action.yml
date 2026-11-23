@@ -23,19 +23,39 @@ inputs:
   max-retries:
     description: 'Maximum retry attempts per model on transient errors before failing over'
     required: false
-    default: '2'
+    default: '1'
   retry-delay:
     description: 'Base delay in seconds between retries'
     required: false
-    default: '15'
+    default: '10'
   request-timeout:
-    description: 'HTTP timeout in seconds for each Gemini API request'
+    description: 'HTTP timeout in seconds for each API request'
     required: false
-    default: '90'
+    default: '60'
   exclude-paths:
     description: 'Optional comma-separated extra glob patterns to exclude from PR diff review'
     required: false
     default: ''
+  fallback-openai-base-url:
+    description: 'Optional OpenAI-compatible API base URL for cross-provider fallback (e.g. Groq or OpenRouter)'
+    required: false
+    default: ''
+  fallback-openai-api-key:
+    description: 'Optional API key for the OpenAI-compatible fallback provider'
+    required: false
+    default: ''
+  fallback-openai-model:
+    description: 'Optional model name for the OpenAI-compatible fallback provider (e.g. openai/gpt-oss-120b)'
+    required: false
+    default: ''
+  pr-size-warn-lines:
+    description: 'Changed source line threshold above which the review includes a PR size warning'
+    required: false
+    default: '800'
+  pr-size-warn-files:
+    description: 'Changed source file count threshold above which the review includes a PR size warning'
+    required: false
+    default: '12'
   python-version:
     description: 'Python version to use'
     required: false
@@ -49,7 +69,7 @@ runs:
   using: 'composite'
   steps:
     - name: Setup Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ inputs.python-version }}
 
@@ -76,6 +96,11 @@ runs:
         DIFF_FILE: pr_diff.txt
         DIFF_STAT_FILE: pr_diff_stat.txt
         EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+        FALLBACK_OPENAI_BASE_URL: ${{ inputs.fallback-openai-base-url }}
+        FALLBACK_OPENAI_API_KEY: ${{ inputs.fallback-openai-api-key }}
+        FALLBACK_OPENAI_MODEL: ${{ inputs.fallback-openai-model }}
+        PR_SIZE_WARN_LINES: ${{ inputs.pr-size-warn-lines }}
+        PR_SIZE_WARN_FILES: ${{ inputs.pr-size-warn-files }}
         GH_TOKEN: ${{ inputs.github-token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}

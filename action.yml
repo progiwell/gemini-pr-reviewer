@@ -93,6 +93,26 @@ inputs:
     description: 'Model(s) for Mistral provider (comma-separated)'
     required: false
     default: 'codestral-latest'
+  review-mode:
+    description: 'Multi-provider execution mode: fallback (default), consensus (feed secondary findings into synthesis + summary), or parallel (post separate review per provider)'
+    required: false
+    default: 'fallback'
+  consensus-max-providers:
+    description: 'Maximum number of enabled providers to query in consensus mode'
+    required: false
+    default: '3'
+  main-reviewers:
+    description: 'Number of primary AI reviewers to run on each PR (remaining enabled providers act as fallbacks or subagents)'
+    required: false
+    default: '2'
+  extra-providers-mode:
+    description: 'How to use enabled providers beyond main-reviewers: fallback (hold in reserve for failover) or subagents (run first and report findings to main reviewers)'
+    required: false
+    default: 'fallback'
+  inline-comments:
+    description: 'Enable exact line-by-line inline PR diff review comments'
+    required: false
+    default: 'true'
   pr-size-warn-lines:
     description: 'Changed source line threshold above which the review includes a PR size warning'
     required: false
@@ -155,6 +175,11 @@ runs:
         CEREBRAS_MODEL: ${{ inputs.cerebras-model }}
         MISTRAL_API_KEY: ${{ inputs.mistral-api-key }}
         MISTRAL_MODEL: ${{ inputs.mistral-model }}
+        REVIEW_MODE: ${{ inputs.review-mode }}
+        CONSENSUS_MAX_PROVIDERS: ${{ inputs.consensus-max-providers }}
+        MAIN_REVIEWERS: ${{ inputs.main-reviewers }}
+        EXTRA_PROVIDERS_MODE: ${{ inputs.extra-providers-mode }}
+        INLINE_COMMENTS: ${{ inputs.inline-comments }}
         PR_SIZE_WARN_LINES: ${{ inputs.pr-size-warn-lines }}
         PR_SIZE_WARN_FILES: ${{ inputs.pr-size-warn-files }}
         GH_TOKEN: ${{ inputs.github-token }}
@@ -168,16 +193,52 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
-        ACTION=$(cat review_action.txt 2>/dev/null || echo "comment")
-        if [ "$ACTION" = "approve" ]; then
-          echo "Review outcome: APPROVE"
-          gh pr review ${{ github.event.pull_request.number }} -F review_output.md --approve || \
-          gh pr review ${{ github.event.pull_request.number }} -F review_output.md --comment
-        elif [ "$ACTION" = "request-changes" ]; then
-          echo "Review outcome: REQUEST_CHANGES"
-          gh pr review ${{ github.event.pull_request.number }} -F review_output.md --request-changes || \
-          gh pr review ${{ github.event.pull_request.number }} -F review_output.md --comment
+        PR_NUM="${{ github.event.pull_request.number }}"
+        REPO="${{ github.repository }}"
+        if [ -f review_outputs.json ]; then
+          python3 - "$REPO" "$PR_NUM" <<'PY'
+        import json
+        import os
+        import subprocess
+        import sys
+
+        repo, pr_num = sys.argv[1], sys.argv[2]
+        with open("review_outputs.json", "r", encoding="utf-8") as f:
+            entries = json.load(f)
+
+        for entry in entries:
+            payload_file = entry.get("payload_file", "")
+            body_file = entry.get("file", "review_output.md")
+            action = entry.get("action", "comment")
+            slot = entry.get("slot_label", entry.get("display_name", "AI Reviewer"))
+            print(f"Posting {slot} ({entry.get('used_model', '')}) with action={action}...")
+
+            if payload_file and os.path.exists(payload_file):
+                res = subprocess.run(
+                    ["gh", "api", f"repos/{repo}/pulls/{pr_num}/reviews", "--method", "POST", "--input", payload_file],
+                    check=False,
+                )
+                if res.returncode == 0:
+                    continue
+                print(f"Inline review API post failed for {slot}; falling back to gh pr review.")
+
+            flag = "--approve" if action == "approve" else ("--request-changes" if action == "request-changes" else "--comment")
+            res = subprocess.run(["gh", "pr", "review", pr_num, "-F", body_file, flag], check=False)
+            if res.returncode != 0 and flag != "--comment":
+                subprocess.run(["gh", "pr", "review", pr_num, "-F", body_file, "--comment"], check=True)
+        PY
         else
-          echo "Review outcome: COMMENT (neutral)"
-          gh pr review ${{ github.event.pull_request.number }} -F review_output.md --comment
+          ACTION=$(cat review_action.txt 2>/dev/null || echo "comment")
+          if [ "$ACTION" = "approve" ]; then
+            echo "Review outcome: APPROVE"
+            gh pr review "$PR_NUM" -F review_output.md --approve || \
+            gh pr review "$PR_NUM" -F review_output.md --comment
+          elif [ "$ACTION" = "request-changes" ]; then
+            echo "Review outcome: REQUEST_CHANGES"
+            gh pr review "$PR_NUM" -F review_output.md --request-changes || \
+            gh pr review "$PR_NUM" -F review_output.md --comment
+          else
+            echo "Review outcome: COMMENT (neutral)"
+            gh pr review "$PR_NUM" -F review_output.md --comment
+          fi
         fi

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import glob
 import json
 import os
 import posixpath
@@ -30,6 +31,21 @@ DEFAULT_CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 DEFAULT_CEREBRAS_MODELS = "llama-3.3-70b"
 DEFAULT_MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
 DEFAULT_MISTRAL_MODELS = "codestral-latest"
+VALID_REVIEW_MODES = ("fallback", "subagents", "consensus", "parallel")
+DEFAULT_REVIEW_MODE = "fallback"
+VALID_EXTRA_PROVIDERS_MODES = ("fallback", "subagents")
+DEFAULT_EXTRA_PROVIDERS_MODE = "fallback"
+DEFAULT_MAIN_REVIEWERS = 2
+DEFAULT_CONSENSUS_MAX_PROVIDERS = 3
+ACTION_TO_GH_EVENT = {
+    "approve": "APPROVE",
+    "request-changes": "REQUEST_CHANGES",
+    "comment": "COMMENT",
+}
+INLINE_COMMENTS_BLOCK_RE = re.compile(
+    r"```json:inline-comments\s*\n?(.*?)```",
+    re.IGNORECASE | re.DOTALL,
+)
 
 DEFAULT_EXCLUDE_BASENAMES = frozenset(
     {
@@ -194,6 +210,43 @@ def build_candidate_models(primary_model: str, fallback_models_raw: str) -> list
     """Builds an ordered, deduplicated list of candidate models from primary and comma-separated fallbacks."""
     candidates = _dedupe_models([primary_model] + str(fallback_models_raw or "").split(","))
     return candidates or [DEFAULT_PRIMARY_MODEL]
+
+
+def parse_review_mode(raw_mode: str) -> str:
+    """Normalizes and validates the configured REVIEW_MODE."""
+    mode = str(raw_mode or "").strip().lower()
+    if mode in VALID_REVIEW_MODES:
+        return mode
+    if mode:
+        print(f"Warning: Unknown review-mode '{raw_mode}'. Falling back to '{DEFAULT_REVIEW_MODE}'.")
+    return DEFAULT_REVIEW_MODE
+
+
+def parse_extra_providers_mode(raw_extra_mode: str, raw_review_mode: str = "") -> str:
+    """Determines whether providers beyond main-reviewers act as 'fallback' or 'subagents'."""
+    mode = str(raw_extra_mode or "").strip().lower()
+    if mode in VALID_EXTRA_PROVIDERS_MODES:
+        return mode
+    if str(raw_review_mode or "").strip().lower() == "subagents":
+        return "subagents"
+    if mode:
+        print(
+            f"Warning: Unknown extra-providers-mode '{raw_extra_mode}'. "
+            f"Falling back to '{DEFAULT_EXTRA_PROVIDERS_MODE}'."
+        )
+    return DEFAULT_EXTRA_PROVIDERS_MODE
+
+
+def parse_bool_env(raw_val: str, default: bool = True) -> bool:
+    """Parses a boolean environment string with a safe default."""
+    cleaned = str(raw_val or "").strip().lower()
+    if not cleaned:
+        return default
+    if cleaned in ("true", "1", "yes", "on"):
+        return True
+    if cleaned in ("false", "0", "no", "off"):
+        return False
+    return default
 
 
 def run_gh_command(args: list[str]) -> tuple[str | None, str]:
@@ -620,6 +673,156 @@ def filter_diff_files(
     return kept, excluded
 
 
+def annotate_diff_with_line_numbers(
+    files: list[tuple[str, str]],
+) -> tuple[list[tuple[str, str]], dict[str, set[int]]]:
+    """Prefixes right-side diff lines with `[L<n>]` and returns valid target line sets per file."""
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    annotated_files: list[tuple[str, str]] = []
+    valid_lines: dict[str, set[int]] = {}
+
+    for filepath, patch in files:
+        norm_fp = filepath.replace("\\", "/").lstrip("./")
+        file_line_set = valid_lines.setdefault(norm_fp, set())
+        out_lines: list[str] = []
+        in_hunk = False
+        new_line: int | None = None
+
+        for line in patch.splitlines():
+            hunk_match = hunk_re.match(line)
+            if hunk_match:
+                new_line = int(hunk_match.group(1))
+                in_hunk = True
+                out_lines.append(line)
+            elif in_hunk and new_line is not None:
+                if line.startswith("+") or line.startswith(" "):
+                    out_lines.append(f"[L{new_line}] {line}")
+                    file_line_set.add(new_line)
+                    new_line += 1
+                elif line.startswith("-") or line.startswith("\\"):
+                    out_lines.append(line)
+                else:
+                    in_hunk = False
+                    out_lines.append(line)
+            else:
+                out_lines.append(line)
+
+        annotated_files.append((filepath, "\n".join(out_lines)))
+
+    return annotated_files, valid_lines
+
+
+def build_inline_comments_instruction() -> str:
+    """Returns prompt instructions for line-by-line diff citations and structured inline comments."""
+    return (
+        "5. Line-by-Line Pinpointing & Inline Diff Comments:\n"
+        "   - Target file lines in the diff are prefixed with `[L<line_number>]`.\n"
+        "   - Whenever you find a bug, missing requirement, edge case, or security issue, cite the exact `path:L<line_number>` in a `#### 📍 Line-by-Line Findings` section.\n"
+        "   - Before your final `[APPROVED]` or `[CHANGES_REQUESTED]` token, include a fenced JSON block labeled ```` ```json:inline-comments ```` containing an array of line-level findings (or `[]` if none):\n"
+        '     [{"path": "relative/file.py", "line": 42, "severity": "error|warning|info", "comment": "Actionable issue description", "suggestion": "optional exact replacement line(s)"}]'
+    )
+
+
+def _insert_before_verdict_token(text: str, extra_section: str) -> str:
+    """Inserts a markdown section immediately before the trailing verdict token if present."""
+    for token in ("[CHANGES_REQUESTED]", "[APPROVED]"):
+        idx = text.rfind(token)
+        if idx != -1:
+            before = text[:idx].rstrip()
+            after = text[idx:].lstrip()
+            return f"{before}\n\n{extra_section}\n\n{after}"
+    return f"{text.rstrip()}\n\n{extra_section}"
+
+
+def extract_inline_comments(
+    review_text: str,
+    valid_diff_lines: dict[str, set[int]],
+    reviewer_label: str,
+    used_model: str,
+    provider_display_name: str,
+) -> tuple[str, list[dict], list[str]]:
+    """Extracts and validates ```json:inline-comments``` blocks into GitHub PR review comment payloads."""
+    matches = list(INLINE_COMMENTS_BLOCK_RE.finditer(review_text))
+    if not matches:
+        return review_text, [], []
+
+    cleaned_text = INLINE_COMMENTS_BLOCK_RE.sub("", review_text)
+    cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text).strip()
+
+    bare_model = _clean_model_name(used_model)
+    source_name = provider_display_name or (
+        used_model.split(" via ", 1)[1] if " via " in used_model else "Google AI Studio"
+    )
+    label = reviewer_label or "AI Reviewer"
+
+    inline_comments: list[dict] = []
+    unanchored_notes: list[str] = []
+
+    for match in matches:
+        raw_json = match.group(1).strip()
+        if not raw_json:
+            continue
+        try:
+            parsed = json.loads(raw_json)
+        except Exception:
+            continue
+        if not isinstance(parsed, list):
+            continue
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            comment_text = str(item.get("comment") or "").strip()
+            try:
+                line_num = int(item.get("line"))
+            except (TypeError, ValueError):
+                continue
+            if not raw_path or not comment_text or line_num <= 0:
+                continue
+
+            norm_path = raw_path.replace("\\", "/").lstrip("./")
+            if norm_path not in valid_diff_lines and norm_path[:2] in ("a/", "b/") and norm_path[2:] in valid_diff_lines:
+                norm_path = norm_path[2:]
+
+            file_valid_lines = valid_diff_lines.get(norm_path, set())
+            target_line: int | None = None
+            if line_num in file_valid_lines:
+                target_line = line_num
+            elif file_valid_lines:
+                nearest = min(file_valid_lines, key=lambda v: abs(v - line_num))
+                if abs(nearest - line_num) <= 3:
+                    target_line = nearest
+
+            severity_badge = str(item.get("severity") or "issue").strip().upper()
+            if target_line is not None:
+                header_line = (
+                    f"🤖 **{label}** (`{bare_model}` via **{source_name}**) · `{severity_badge}`"
+                )
+                body_parts = [header_line, "", comment_text]
+                suggestion = str(item.get("suggestion") or "").strip("\r\n")
+                if suggestion:
+                    body_parts.extend(["", f"```suggestion\n{suggestion}\n```"])
+                inline_comments.append(
+                    {
+                        "path": norm_path,
+                        "line": target_line,
+                        "side": "RIGHT",
+                        "body": "\n".join(body_parts),
+                    }
+                )
+            else:
+                unanchored_notes.append(f"- **{norm_path}:L{line_num}** ({severity_badge}): {comment_text}")
+
+    if unanchored_notes:
+        cleaned_text = _insert_before_verdict_token(
+            cleaned_text,
+            "#### 📌 Additional Line Notes\n" + "\n".join(unanchored_notes),
+        )
+
+    return cleaned_text, inline_comments, unanchored_notes
+
+
 def build_diff_overview(diff_stat_text: str, excluded_files: list[tuple[str, str]]) -> str:
     """Builds a compact diff summary block including `git diff --stat` and excluded artifacts."""
     sections: list[str] = []
@@ -928,6 +1131,7 @@ def invoke_with_fallback(
     request_timeout_sec: int = 60,
     openai_fallback: OpenAIFallbackConfig | None = None,
     providers: list[ProviderSpec] | None = None,
+    extra_secrets: tuple[str, ...] = (),
 ) -> tuple[str | None, str, str]:
     """Invokes candidate models across configured providers in priority order."""
     if providers is None:
@@ -965,6 +1169,7 @@ def invoke_with_fallback(
         api_key,
         openai_fallback.api_key if openai_fallback else "",
         *(p.api_key for p in active_providers),
+        *extra_secrets,
     ]:
         if secret and secret not in secrets_list:
             secrets_list.append(secret)
@@ -1114,6 +1319,8 @@ def run_chunked_review(
     request_timeout_sec: int = 60,
     openai_fallback: OpenAIFallbackConfig | None = None,
     providers: list[ProviderSpec] | None = None,
+    extra_context: str = "",
+    extra_secrets: tuple[str, ...] = (),
 ) -> tuple[str | None, str, str]:
     """Runs Map-Reduce review across file-boundary chunks and synthesizes one final verdict."""
     chunk_system_instruction = (
@@ -1162,6 +1369,7 @@ def run_chunked_review(
             request_timeout_sec=request_timeout_sec,
             openai_fallback=openai_fallback,
             providers=providers,
+            extra_secrets=extra_secrets,
         )
         last_model = chunk_model
         if chunk_text is None:
@@ -1196,6 +1404,7 @@ def run_chunked_review(
 
     overview_section = f"\n{diff_overview}\n" if diff_overview else ""
     warnings_section = ("\n\n" + "\n\n".join(coverage_warnings)) if coverage_warnings else ""
+    extra_section = f"\n{extra_context}\n" if extra_context else ""
     combined_notes = "\n\n---\n\n".join(chunk_notes)
 
     reduce_prompt = f"""
@@ -1206,7 +1415,7 @@ def run_chunked_review(
 **PR Title:** {pr_title}
 **PR Description:**
 {pr_body}
-{overview_section}
+{overview_section}{extra_section}
 # Chunk Review Findings ({len(chunk_notes)}/{len(chunks)} chunks reviewed)
 Synthesize the chunk findings below into a single coherent code review against the Original Issue and critical rules.
 {warnings_section}
@@ -1224,15 +1433,433 @@ Synthesize the chunk findings below into a single coherent code review against t
         request_timeout_sec=request_timeout_sec,
         openai_fallback=openai_fallback,
         providers=providers,
+        extra_secrets=extra_secrets,
     )
 
 
-def format_review_header(used_model: str, chunk_count: int = 0) -> str:
-    """Builds the markdown header attributing the model and provider used for review."""
+@dataclass(frozen=True)
+class ProviderReviewResult:
+    """Outcome of running a code review on a single AI provider."""
+
+    provider_id: str
+    display_name: str
+    used_model: str
+    review_text: str | None
+    error: str = ""
+    slot_label: str = ""
+    fallback_from: tuple[str, ...] = ()
+    subagents_used: tuple[str, ...] = ()
+
+    @property
+    def succeeded(self) -> bool:
+        return self.review_text is not None
+
+    @property
+    def action(self) -> str:
+        if not self.review_text:
+            return "comment"
+        return resolve_review_action(self.review_text)
+
+
+def _clean_model_name(used_model: str) -> str:
+    """Extracts the bare model identifier from a provider-annotated model label."""
+    cleaned = used_model.replace(" (OpenAI-compatible fallback)", "")
+    if " via " in cleaned:
+        cleaned = cleaned.split(" via ", 1)[0]
+    return cleaned.strip()
+
+
+def run_single_provider_review(
+    provider: ProviderSpec,
+    client: genai.Client | None,
+    prompt: str,
+    system_instruction: str,
+    max_retries: int,
+    base_delay: int,
+    api_key: str,
+    request_timeout_sec: int,
+    chunks: list[list[tuple[str, str]]] | None = None,
+    omitted_files: list[str] | None = None,
+    diff_overview: str = "",
+    issue_context_block: str = "",
+    pr_title: str = "",
+    pr_body: str = "",
+    chunk_pause: int = 0,
+    extra_context: str = "",
+    extra_secrets: tuple[str, ...] = (),
+) -> ProviderReviewResult:
+    """Executes a full review (single-shot or chunked) against a single provider."""
+    provider_api_key = provider.api_key if provider.kind == "gemini" else api_key
+    if chunks:
+        text, used_model, err = run_chunked_review(
+            client=client,
+            candidate_models=list(provider.models),
+            chunks=chunks,
+            omitted_files=omitted_files or [],
+            diff_overview=diff_overview,
+            issue_context_block=issue_context_block,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            system_instruction=system_instruction,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            api_key=provider_api_key,
+            chunk_pause=chunk_pause,
+            request_timeout_sec=request_timeout_sec,
+            providers=[provider],
+            extra_context=extra_context,
+            extra_secrets=extra_secrets,
+        )
+    else:
+        text, used_model, err = invoke_with_fallback(
+            client,
+            list(provider.models),
+            prompt,
+            system_instruction,
+            max_retries,
+            base_delay,
+            api_key=provider_api_key,
+            request_timeout_sec=request_timeout_sec,
+            providers=[provider],
+            extra_secrets=extra_secrets,
+        )
+    return ProviderReviewResult(
+        provider_id=provider.provider_id,
+        display_name=provider.display_name,
+        used_model=used_model,
+        review_text=text,
+        error=err,
+    )
+
+
+def run_multi_reviewer_pipeline(
+    providers: list[ProviderSpec],
+    client: genai.Client | None,
+    prompt: str,
+    system_instruction: str,
+    max_retries: int,
+    base_delay: int,
+    api_key: str,
+    request_timeout_sec: int,
+    main_reviewers_count: int = DEFAULT_MAIN_REVIEWERS,
+    extra_providers_mode: str = DEFAULT_EXTRA_PROVIDERS_MODE,
+    chunks: list[list[tuple[str, str]]] | None = None,
+    omitted_files: list[str] | None = None,
+    diff_overview: str = "",
+    issue_context_block: str = "",
+    pr_title: str = "",
+    pr_body: str = "",
+    chunk_pause: int = 0,
+) -> list[ProviderReviewResult]:
+    """Runs up to main_reviewers_count main reviewers, using extra providers as fallbacks or subagents."""
+    target_count = max(1, main_reviewers_count)
+    all_secrets = tuple(p.api_key for p in providers if p.api_key)
+
+    if extra_providers_mode == "subagents" and len(providers) > target_count:
+        main_candidates = providers[:target_count]
+        subagent_candidates = providers[target_count:]
+        subagent_system_instruction = (
+            "You are a Subagent Code Reviewer assisting the primary PR reviewers.\n"
+            "Analyze the PR diff against the Original Issue and concisely report:\n"
+            "1. Exact `path:L<line_number>` locations of any bugs, edge cases, missing requirements, or security issues.\n"
+            "2. Missing or weak unit tests.\n"
+            "Keep your findings factual and concise—the Main Reviewers will verify and incorporate valid findings."
+        )
+        subagent_results = [
+            run_single_provider_review(
+                provider=provider,
+                client=client,
+                prompt=prompt,
+                system_instruction=subagent_system_instruction,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                api_key=api_key,
+                request_timeout_sec=request_timeout_sec,
+                chunks=chunks,
+                omitted_files=omitted_files,
+                diff_overview=diff_overview,
+                issue_context_block=issue_context_block,
+                pr_title=pr_title,
+                pr_body=pr_body,
+                chunk_pause=chunk_pause,
+                extra_secrets=all_secrets,
+            )
+            for provider in subagent_candidates
+        ]
+        succeeded_subagents = [r for r in subagent_results if r.succeeded]
+        subagent_labels = tuple(r.used_model for r in succeeded_subagents)
+        subagent_reports_block = ""
+        if succeeded_subagents:
+            report_sections = "\n\n---\n\n".join(
+                f"### Subagent Report from {r.used_model} (Provider: {r.display_name})\n{r.review_text}"
+                for r in succeeded_subagents
+            )
+            subagent_reports_block = (
+                "\n\n# Subagent Reviewer Reports\n"
+                "Subagent reviewers analyzed the PR first and reported these findings for your verification:\n\n"
+                f"{report_sections}\n"
+            )
+        augmented_prompt = f"{prompt}{subagent_reports_block}" if prompt else ""
+
+        succeeded_main: list[ProviderReviewResult] = []
+        failed_results: list[ProviderReviewResult] = []
+        failed_names: list[str] = []
+
+        for provider in main_candidates:
+            res = run_single_provider_review(
+                provider=provider,
+                client=client,
+                prompt=augmented_prompt,
+                system_instruction=system_instruction,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                api_key=api_key,
+                request_timeout_sec=request_timeout_sec,
+                chunks=chunks,
+                omitted_files=omitted_files,
+                diff_overview=diff_overview,
+                issue_context_block=issue_context_block,
+                pr_title=pr_title,
+                pr_body=pr_body,
+                chunk_pause=chunk_pause,
+                extra_context=subagent_reports_block,
+                extra_secrets=all_secrets,
+            )
+            if res.succeeded:
+                slot_num = len(succeeded_main) + 1
+                succeeded_main.append(
+                    ProviderReviewResult(
+                        provider_id=res.provider_id,
+                        display_name=res.display_name,
+                        used_model=res.used_model,
+                        review_text=res.review_text,
+                        error=res.error,
+                        slot_label=f"Main Reviewer #{slot_num}",
+                        fallback_from=tuple(failed_names),
+                        subagents_used=subagent_labels,
+                    )
+                )
+                failed_names = []
+            else:
+                failed_results.append(res)
+                failed_names.append(provider.display_name)
+
+        for sub_res in succeeded_subagents:
+            if len(succeeded_main) >= target_count:
+                break
+            slot_num = len(succeeded_main) + 1
+            succeeded_main.append(
+                ProviderReviewResult(
+                    provider_id=sub_res.provider_id,
+                    display_name=sub_res.display_name,
+                    used_model=sub_res.used_model,
+                    review_text=sub_res.review_text,
+                    error=sub_res.error,
+                    slot_label=f"Main Reviewer #{slot_num}",
+                    fallback_from=tuple(failed_names),
+                )
+            )
+            failed_names = []
+
+        return succeeded_main or (failed_results + [r for r in subagent_results if not r.succeeded])
+
+    succeeded_main = []
+    failed_results = []
+    failed_since_last_slot: list[str] = []
+
+    for provider in providers:
+        if len(succeeded_main) >= target_count:
+            break
+        res = run_single_provider_review(
+            provider=provider,
+            client=client,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            api_key=api_key,
+            request_timeout_sec=request_timeout_sec,
+            chunks=chunks,
+            omitted_files=omitted_files,
+            diff_overview=diff_overview,
+            issue_context_block=issue_context_block,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            chunk_pause=chunk_pause,
+            extra_secrets=all_secrets,
+        )
+        if res.succeeded:
+            slot_num = len(succeeded_main) + 1
+            succeeded_main.append(
+                ProviderReviewResult(
+                    provider_id=res.provider_id,
+                    display_name=res.display_name,
+                    used_model=res.used_model,
+                    review_text=res.review_text,
+                    error=res.error,
+                    slot_label=f"Main Reviewer #{slot_num}",
+                    fallback_from=tuple(failed_since_last_slot),
+                )
+            )
+            failed_since_last_slot = []
+        else:
+            failed_results.append(res)
+            failed_since_last_slot.append(provider.display_name)
+
+    return succeeded_main or failed_results
+
+
+def build_consensus_summary_table(results: list[ProviderReviewResult]) -> str:
+    """Builds a markdown summary table of individual provider verdicts in consensus mode."""
+    lines = [
+        "#### 🤝 Multi-Provider Consensus Summary",
+        "| Provider | Model | Verdict |",
+        "|---|---|---|",
+    ]
+    for r in results:
+        model_col = f"`{_clean_model_name(r.used_model)}`"
+        if not r.succeeded:
+            verdict = "⚠️ Unavailable"
+        elif r.action == "approve":
+            verdict = "✅ Approved"
+        elif r.action == "request-changes":
+            verdict = "❌ Changes Requested"
+        else:
+            verdict = "💬 Comment"
+        lines.append(f"| **{r.display_name}** | {model_col} | {verdict} |")
+    return "\n".join(lines)
+
+
+def run_consensus_review(
+    providers: list[ProviderSpec],
+    client: genai.Client | None,
+    prompt: str,
+    system_instruction: str,
+    max_retries: int,
+    base_delay: int,
+    api_key: str,
+    request_timeout_sec: int,
+    consensus_max_providers: int = DEFAULT_CONSENSUS_MAX_PROVIDERS,
+    chunks: list[list[tuple[str, str]]] | None = None,
+    omitted_files: list[str] | None = None,
+    diff_overview: str = "",
+    issue_context_block: str = "",
+    pr_title: str = "",
+    pr_body: str = "",
+    chunk_pause: int = 0,
+) -> tuple[str | None, str, str]:
+    """Queries up to consensus_max_providers providers and synthesizes their findings."""
+    selected = providers[: max(1, consensus_max_providers)]
+    all_secrets = tuple(p.api_key for p in providers if p.api_key)
+    results = [
+        run_single_provider_review(
+            provider=provider,
+            client=client,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            api_key=api_key,
+            request_timeout_sec=request_timeout_sec,
+            chunks=chunks,
+            omitted_files=omitted_files,
+            diff_overview=diff_overview,
+            issue_context_block=issue_context_block,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            chunk_pause=chunk_pause,
+            extra_secrets=all_secrets,
+        )
+        for provider in selected
+    ]
+    succeeded = [r for r in results if r.succeeded]
+    if not succeeded:
+        return None, results[-1].used_model, results[-1].error
+
+    table_md = build_consensus_summary_table(results)
+    if len(succeeded) == 1:
+        return f"{table_md}\n\n{succeeded[0].review_text}", succeeded[0].used_model, ""
+
+    overview_section = f"\n{diff_overview}\n" if diff_overview else ""
+    findings_blocks = "\n\n---\n\n".join(
+        f"### Findings from {r.used_model}\n{r.review_text}" for r in succeeded
+    )
+    synthesis_prompt = f"""
+# Original GitHub Issue Specification (Source of Truth)
+{issue_context_block}
+
+# Pull Request Metadata (Developer / Agent Claim)
+**PR Title:** {pr_title}
+**PR Description:**
+{pr_body}
+{overview_section}
+# Individual AI Provider Review Findings ({len(succeeded)}/{len(selected)} providers succeeded)
+Synthesize the independent code review findings below into one cohesive, non-redundant final review against the Original Issue and critical rules.
+Preserve the `#### 📋 Issue Requirements Checklist` section, include all valid bugs, edge cases, missing tests, or security issues identified by any provider, and output `[CHANGES_REQUESTED]` if any valid requirement, bug, or security concern remains unaddressed.
+
+{findings_blocks}
+"""
+    synth_text, _, _ = invoke_with_fallback(
+        client,
+        list(selected[0].models),
+        synthesis_prompt,
+        system_instruction,
+        max_retries,
+        base_delay,
+        api_key=api_key,
+        request_timeout_sec=request_timeout_sec,
+        providers=selected,
+        extra_secrets=all_secrets,
+    )
+    if synth_text is None:
+        synth_text = findings_blocks
+
+    if any(r.action == "request-changes" for r in succeeded):
+        if "[APPROVED]" in synth_text:
+            synth_text = synth_text.replace("[APPROVED]", "[CHANGES_REQUESTED]")
+        elif "[CHANGES_REQUESTED]" not in synth_text:
+            synth_text = synth_text.rstrip() + "\n\n[CHANGES_REQUESTED]\n"
+
+    consensus_label = f"Consensus: {', '.join(r.used_model for r in succeeded)}"
+    return f"{table_md}\n\n{synth_text}", consensus_label, ""
+
+
+def format_review_header(
+    used_model: str,
+    chunk_count: int = 0,
+    slot_label: str = "",
+    provider_display_name: str = "",
+    fallback_from: tuple[str, ...] = (),
+    subagents_used: tuple[str, ...] = (),
+) -> str:
+    """Builds the markdown header attributing the reviewer slot, source provider, and AI model."""
     header_suffix = f" · {chunk_count}-chunk review" if chunk_count > 1 else ""
-    if "(OpenAI-compatible fallback)" in used_model or " via " in used_model:
-        return f"### AI Code Review ({used_model}{header_suffix})\n\n"
-    return f"### AI Code Review ({used_model} via Google AI Studio{header_suffix})\n\n"
+    if (
+        "(OpenAI-compatible fallback)" in used_model
+        or " via " in used_model
+        or used_model.startswith("Consensus:")
+    ):
+        h3 = f"### AI Code Review ({used_model}{header_suffix})"
+    else:
+        h3 = f"### AI Code Review ({used_model} via Google AI Studio{header_suffix})"
+
+    if not slot_label and not provider_display_name and not fallback_from and not subagents_used:
+        return h3 + "\n\n"
+
+    bare_model = _clean_model_name(used_model)
+    source_name = provider_display_name or (
+        used_model.split(" via ", 1)[1] if " via " in used_model else "Google AI Studio"
+    )
+    badges: list[str] = []
+    if slot_label:
+        badges.append(f"**Reviewer:** `{slot_label}`")
+    badges.append(f"**Source Provider:** `{source_name}`")
+    badges.append(f"**AI Model:** `{bare_model}`")
+    if fallback_from:
+        badges.append(f"**Fallback For:** `{', '.join(fallback_from)}`")
+    if subagents_used:
+        badges.append(f"**Subagents Consulted:** `{', '.join(subagents_used)}`")
+    return f"{h3}\n> {' · '.join(badges)}\n\n"
 
 
 def resolve_review_action(review_text: str) -> str:
@@ -1244,6 +1871,70 @@ def resolve_review_action(review_text: str) -> str:
     return "comment"
 
 
+def finalize_review_body(
+    review_text: str,
+    used_model: str,
+    api_succeeded: bool,
+    missing_issue_strict: bool,
+    unlinked_review_count: int,
+    bypass_keyword: str,
+    pr_size_callout: str,
+    chunk_count: int = 0,
+    slot_label: str = "",
+    provider_display_name: str = "",
+    fallback_from: tuple[str, ...] = (),
+    subagents_used: tuple[str, ...] = (),
+) -> tuple[str, str]:
+    """Applies strict missing-issue policy, resolves review action, and prepends header & PR size callout."""
+    if missing_issue_strict:
+        banner = build_missing_issue_banner(unlinked_review_count, bypass_keyword)
+        if "[APPROVED]" in review_text:
+            review_text = review_text.replace("[APPROVED]", "[CHANGES_REQUESTED]")
+        elif "[CHANGES_REQUESTED]" not in review_text:
+            review_text = review_text.rstrip() + "\n\n[CHANGES_REQUESTED]\n"
+        review_text = banner + review_text
+        review_action = "request-changes"
+    elif api_succeeded:
+        review_action = resolve_review_action(review_text)
+    else:
+        review_action = "comment"
+
+    header = format_review_header(
+        used_model,
+        chunk_count=chunk_count,
+        slot_label=slot_label,
+        provider_display_name=provider_display_name,
+        fallback_from=fallback_from,
+        subagents_used=subagents_used,
+    )
+    size_prefix = f"{pr_size_callout}\n\n" if pr_size_callout else ""
+    return header + size_prefix + review_text, review_action
+
+
+def cleanup_parallel_review_outputs() -> None:
+    """Removes stale parallel review and payload artifacts from previous runs in the current directory."""
+    for pattern in ("review_output_extra_*.md", "review_payload_*.json"):
+        for artifact_path in glob.glob(pattern):
+            try:
+                os.remove(artifact_path)
+            except OSError:
+                pass
+    if os.path.exists("review_outputs.json"):
+        try:
+            os.remove("review_outputs.json")
+        except OSError:
+            pass
+
+
+def build_github_review_payload(body: str, action: str, comments: list[dict]) -> dict:
+    """Builds a GitHub Pull Request Review API payload with optional inline line comments."""
+    return {
+        "event": ACTION_TO_GH_EVENT.get(action, "COMMENT"),
+        "body": body,
+        "comments": comments,
+    }
+
+
 def write_review_outputs(output_body: str, review_action: str) -> None:
     """Writes review_output.md and review_action.txt for the composite action post-step."""
     with open("review_output.md", "w") as f:
@@ -1252,7 +1943,96 @@ def write_review_outputs(output_body: str, review_action: str) -> None:
         f.write(review_action)
 
 
+def write_parallel_review_outputs(
+    extra_bodies: list[str],
+    metadata: list[dict],
+    payloads: list[dict] | None = None,
+) -> None:
+    """Writes extra provider review markdown files, API payloads, and summary metadata."""
+    cleanup_parallel_review_outputs()
+    for idx, body in enumerate(extra_bodies, start=1):
+        with open(f"review_output_extra_{idx}.md", "w") as f:
+            f.write(body)
+    for idx, payload in enumerate(payloads or [], start=1):
+        with open(f"review_payload_{idx}.json", "w") as f:
+            json.dump(payload, f, indent=2)
+    with open("review_outputs.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def _emit_reviewer_outputs(
+    results: list[ProviderReviewResult],
+    inline_comments_enabled: bool,
+    valid_diff_lines: dict[str, set[int]],
+    missing_issue_strict: bool,
+    unlinked_review_count: int,
+    bypass_keyword: str,
+    pr_size_callout: str,
+    chunk_count: int,
+) -> None:
+    """Extracts inline comments, finalizes review bodies, and emits files & GitHub API payloads."""
+    bodies: list[str] = []
+    actions: list[str] = []
+    payloads: list[dict] = []
+    metadata: list[dict] = []
+
+    for idx, res in enumerate(results, start=1):
+        raw_text = res.review_text or ""
+        slot = res.slot_label or f"Main Reviewer #{idx}"
+        if inline_comments_enabled:
+            cleaned_text, comments, _ = extract_inline_comments(
+                raw_text,
+                valid_diff_lines,
+                reviewer_label=slot,
+                used_model=res.used_model,
+                provider_display_name=res.display_name,
+            )
+        else:
+            cleaned_text, comments = raw_text, []
+
+        body, act = finalize_review_body(
+            review_text=cleaned_text,
+            used_model=res.used_model,
+            api_succeeded=True,
+            missing_issue_strict=missing_issue_strict,
+            unlinked_review_count=unlinked_review_count,
+            bypass_keyword=bypass_keyword,
+            pr_size_callout=pr_size_callout,
+            chunk_count=chunk_count,
+            slot_label=res.slot_label,
+            provider_display_name=res.display_name,
+            fallback_from=res.fallback_from,
+            subagents_used=res.subagents_used,
+        )
+        bodies.append(body)
+        actions.append(act)
+        payloads.append(build_github_review_payload(body, act, comments))
+        metadata.append(
+            {
+                "slot_label": slot,
+                "provider_id": res.provider_id,
+                "display_name": res.display_name,
+                "used_model": res.used_model,
+                "action": act,
+                "file": "review_output.md" if idx == 1 else f"review_output_extra_{idx - 1}.md",
+                "payload_file": f"review_payload_{idx}.json",
+                "inline_comment_count": len(comments),
+            }
+        )
+
+    if "request-changes" in actions:
+        aggregated_action = "request-changes"
+    elif "approve" in actions:
+        aggregated_action = "approve"
+    else:
+        aggregated_action = "comment"
+
+    write_review_outputs(bodies[0], aggregated_action)
+    write_parallel_review_outputs(bodies[1:], metadata, payloads=payloads)
+
+
 def main():
+    cleanup_parallel_review_outputs()
     max_retries = int(os.environ.get("GEMINI_MAX_RETRIES", "1"))
     base_delay = int(os.environ.get("GEMINI_RETRY_DELAY", "10"))
     request_timeout_sec = max(10, int(os.environ.get("GEMINI_REQUEST_TIMEOUT", "60")))
@@ -1262,6 +2042,17 @@ def main():
     chunk_pause = max(0, int(os.environ.get("GEMINI_CHUNK_PAUSE", "2")))
     pr_size_warn_lines = max(1, int(os.environ.get("PR_SIZE_WARN_LINES", "800")))
     pr_size_warn_files = max(1, int(os.environ.get("PR_SIZE_WARN_FILES", "12")))
+    review_mode = parse_review_mode(os.environ.get("REVIEW_MODE", DEFAULT_REVIEW_MODE))
+    extra_providers_mode = parse_extra_providers_mode(
+        os.environ.get("EXTRA_PROVIDERS_MODE", ""), review_mode
+    )
+    main_reviewers_count = max(
+        1, int(os.environ.get("MAIN_REVIEWERS", str(DEFAULT_MAIN_REVIEWERS)))
+    )
+    inline_comments_enabled = parse_bool_env(os.environ.get("INLINE_COMMENTS", "true"), default=True)
+    consensus_max_providers = max(
+        1, int(os.environ.get("CONSENSUS_MAX_PROVIDERS", str(DEFAULT_CONSENSUS_MAX_PROVIDERS)))
+    )
 
     openai_fallback = OpenAIFallbackConfig(
         base_url=os.environ.get("FALLBACK_OPENAI_BASE_URL", ""),
@@ -1325,7 +2116,12 @@ def main():
         kept_files, excluded_files, warn_lines=pr_size_warn_lines, warn_files=pr_size_warn_files
     )
     diff_overview = build_diff_overview(diff_stat_text, excluded_files)
-    filtered_diff = "\n".join(patch for _, patch in kept_files)
+    if inline_comments_enabled:
+        prompt_files, valid_diff_lines = annotate_diff_with_line_numbers(kept_files)
+    else:
+        prompt_files, valid_diff_lines = kept_files, {}
+
+    filtered_diff = "\n".join(patch for _, patch in prompt_files)
     if excluded_only_fallback and len(filtered_diff) > single_shot_max_chars:
         filtered_diff = (
             filtered_diff[:single_shot_max_chars]
@@ -1369,6 +2165,7 @@ def main():
         bypass_keyword,
     )
 
+    inline_rule = f"\n    {build_inline_comments_instruction()}" if inline_comments_enabled else ""
     system_instruction = f"""
     You are an expert, strict, and highly capable Code Reviewer.
     Your job is to review pull request code changes (diffs) against the original issue specification and provide actionable feedback.
@@ -1378,7 +2175,7 @@ def main():
     {issue_rule}
     2. Code Quality: Code must align with architectural standards, handle edge cases, and be clean and maintainable.
     3. Testing: Unit tests must be added or updated to cover new features, bug fixes, and edge cases.
-    4. Security: Absolutely NO hardcoded secrets, API keys, passwords, or security vulnerabilities.
+    4. Security: Absolutely NO hardcoded secrets, API keys, passwords, or security vulnerabilities.{inline_rule}
 
     INSTRUCTIONS:
     - First, evaluate alignment with the Original Issue (if linked) before trusting the PR description.
@@ -1400,31 +2197,16 @@ def main():
         else None
     )
 
+    chunks: list[list[tuple[str, str]]] | None = None
+    omitted_files: list[str] = []
     chunk_count = 0
+    prompt = ""
     if len(filtered_diff) > single_shot_max_chars:
-        chunks, omitted_files = chunk_diff_files(kept_files, chunk_target_chars, max_chunks)
+        chunks, omitted_files = chunk_diff_files(prompt_files, chunk_target_chars, max_chunks)
         chunk_count = len(chunks)
         print(
-            f"Large PR diff detected ({len(filtered_diff):,} chars across {len(kept_files)} file(s)). "
+            f"Large PR diff detected ({len(filtered_diff):,} chars across {len(prompt_files)} file(s)). "
             f"Running file-aware chunked review across {chunk_count} chunk(s)..."
-        )
-        review_text, used_model, last_err = run_chunked_review(
-            client=client,
-            candidate_models=candidate_models,
-            chunks=chunks,
-            omitted_files=omitted_files,
-            diff_overview=diff_overview,
-            issue_context_block=issue_context_block,
-            pr_title=pr_title,
-            pr_body=pr_body,
-            system_instruction=system_instruction,
-            max_retries=max_retries,
-            base_delay=base_delay,
-            api_key=api_key,
-            chunk_pause=chunk_pause,
-            request_timeout_sec=request_timeout_sec,
-            openai_fallback=openai_fallback,
-            providers=providers,
         )
     else:
         overview_section = f"\n{diff_overview}\n" if diff_overview else ""
@@ -1444,55 +2226,110 @@ def main():
     {filtered_diff}
     ```
     """
-        review_text, used_model, last_err = invoke_with_fallback(
-            client,
-            candidate_models,
-            prompt,
-            system_instruction,
-            max_retries,
-            base_delay,
+
+    if review_mode == "consensus" and len(providers) > 1:
+        review_text, used_model, last_err = run_consensus_review(
+            providers=providers,
+            client=client,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            max_retries=max_retries,
+            base_delay=base_delay,
             api_key=api_key,
             request_timeout_sec=request_timeout_sec,
-            openai_fallback=openai_fallback,
+            consensus_max_providers=consensus_max_providers,
+            chunks=chunks,
+            omitted_files=omitted_files,
+            diff_overview=diff_overview,
+            issue_context_block=issue_context_block,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            chunk_pause=chunk_pause,
+        )
+        if review_text is not None:
+            _emit_reviewer_outputs(
+                [
+                    ProviderReviewResult(
+                        provider_id="consensus",
+                        display_name="Multi-Provider Consensus",
+                        used_model=used_model,
+                        review_text=review_text,
+                        slot_label="Consensus Review",
+                    )
+                ],
+                inline_comments_enabled=inline_comments_enabled,
+                valid_diff_lines=valid_diff_lines,
+                missing_issue_strict=missing_issue_strict,
+                unlinked_review_count=unlinked_review_count,
+                bypass_keyword=bypass_keyword,
+                pr_size_callout=pr_size_callout,
+                chunk_count=chunk_count,
+            )
+            return
+    else:
+        target_main_count = len(providers) if review_mode == "parallel" else main_reviewers_count
+        results = run_multi_reviewer_pipeline(
             providers=providers,
+            client=client,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            api_key=api_key,
+            request_timeout_sec=request_timeout_sec,
+            main_reviewers_count=target_main_count,
+            extra_providers_mode=extra_providers_mode,
+            chunks=chunks,
+            omitted_files=omitted_files,
+            diff_overview=diff_overview,
+            issue_context_block=issue_context_block,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            chunk_pause=chunk_pause,
+        )
+        succeeded = [r for r in results if r.succeeded]
+        if succeeded:
+            _emit_reviewer_outputs(
+                succeeded,
+                inline_comments_enabled=inline_comments_enabled,
+                valid_diff_lines=valid_diff_lines,
+                missing_issue_strict=missing_issue_strict,
+                unlinked_review_count=unlinked_review_count,
+                bypass_keyword=bypass_keyword,
+                pr_size_callout=pr_size_callout,
+                chunk_count=chunk_count,
+            )
+            return
+        used_model = results[-1].used_model
+        last_err = results[-1].error
+
+    if is_fatal_auth_error(last_err) and len(providers) == 1:
+        cred_hint = "GEMINI_API_KEY" if providers[0].kind == "gemini" else f"{providers[0].display_name} credentials"
+        review_text = (
+            f"> [!WARNING]\n"
+            f"> Automated AI review failed due to authentication or permissions ({last_err}). "
+            f"Please verify `{cred_hint}` and proceed with manual review."
+        )
+    else:
+        tested = [m for p in providers for m in p.models]
+        err_detail = f" Last error: `{last_err}`." if last_err else ""
+        review_text = (
+            f"> [!WARNING]\n"
+            f"> Automated AI review temporarily unavailable after testing "
+            f"models ({', '.join(tested)}).{err_detail} Please proceed with manual review."
         )
 
-    api_succeeded = review_text is not None
-    if not api_succeeded:
-        if is_fatal_auth_error(last_err) and len(providers) == 1:
-            cred_hint = "GEMINI_API_KEY" if providers[0].kind == "gemini" else f"{providers[0].display_name} credentials"
-            review_text = (
-                f"> [!WARNING]\n"
-                f"> Automated AI review failed due to authentication or permissions ({last_err}). "
-                f"Please verify `{cred_hint}` and proceed with manual review."
-            )
-        else:
-            tested = [m for p in providers for m in p.models]
-            err_detail = f" Last error: `{last_err}`." if last_err else ""
-            review_text = (
-                f"> [!WARNING]\n"
-                f"> Automated AI review temporarily unavailable after testing "
-                f"models ({', '.join(tested)}).{err_detail} Please proceed with manual review."
-            )
-
-    # Enforce strict missing-issue policy deterministically if no issue is linked and not bypassed
-    if missing_issue_strict:
-        banner = build_missing_issue_banner(unlinked_review_count, bypass_keyword)
-        if "[APPROVED]" in review_text:
-            review_text = review_text.replace("[APPROVED]", "[CHANGES_REQUESTED]")
-        elif "[CHANGES_REQUESTED]" not in review_text:
-            review_text = review_text.rstrip() + "\n\n[CHANGES_REQUESTED]\n"
-        review_text = banner + review_text
-        review_action = "request-changes"
-    elif api_succeeded:
-        review_action = resolve_review_action(review_text)
-    else:
-        review_action = "comment"
-
-    header = format_review_header(used_model, chunk_count)
-
-    size_prefix = f"{pr_size_callout}\n\n" if pr_size_callout else ""
-    write_review_outputs(header + size_prefix + review_text, review_action)
+    output_body, review_action = finalize_review_body(
+        review_text=review_text,
+        used_model=used_model,
+        api_succeeded=False,
+        missing_issue_strict=missing_issue_strict,
+        unlinked_review_count=unlinked_review_count,
+        bypass_keyword=bypass_keyword,
+        pr_size_callout=pr_size_callout,
+        chunk_count=chunk_count,
+    )
+    write_review_outputs(output_body, review_action)
 
 
 if __name__ == "__main__":

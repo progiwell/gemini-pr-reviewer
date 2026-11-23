@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 pr_diff.txt
+pr_diff_stat.txt
 review_output.md
 review_action.txt
 .DS_Store

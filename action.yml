@@ -6,8 +6,9 @@ branding:
 
 inputs:
   gemini-api-key:
-    description: 'Google AI Studio Gemini API Key'
-    required: true
+    description: 'Google AI Studio Gemini API Key (optional when another free AI provider is enabled)'
+    required: false
+    default: ''
   github-token:
     description: 'GitHub token for posting review comments'
     required: false
@@ -48,6 +49,50 @@ inputs:
     description: 'Optional model name for the OpenAI-compatible fallback provider (e.g. openai/gpt-oss-120b)'
     required: false
     default: ''
+  provider-order:
+    description: 'Comma-separated priority order across enabled AI providers'
+    required: false
+    default: 'gemini,github-models,groq,openrouter,cerebras,mistral,custom-openai'
+  enable-github-models:
+    description: 'Enable GitHub Models free tier using github-token (requires permissions: models: read)'
+    required: false
+    default: 'false'
+  github-models-model:
+    description: 'Model(s) for GitHub Models provider (comma-separated)'
+    required: false
+    default: 'openai/gpt-4.1-mini'
+  groq-api-key:
+    description: 'Optional Groq API key for free-tier review/fallback'
+    required: false
+    default: ''
+  groq-model:
+    description: 'Model(s) for Groq provider (comma-separated)'
+    required: false
+    default: 'openai/gpt-oss-120b,llama-3.3-70b-versatile'
+  openrouter-api-key:
+    description: 'Optional OpenRouter API key for :free models'
+    required: false
+    default: ''
+  openrouter-model:
+    description: 'Model(s) for OpenRouter provider (comma-separated)'
+    required: false
+    default: 'qwen/qwen3-coder:free,deepseek/deepseek-r1:free'
+  cerebras-api-key:
+    description: 'Optional Cerebras API key'
+    required: false
+    default: ''
+  cerebras-model:
+    description: 'Model(s) for Cerebras provider (comma-separated)'
+    required: false
+    default: 'llama-3.3-70b'
+  mistral-api-key:
+    description: 'Optional Mistral API key'
+    required: false
+    default: ''
+  mistral-model:
+    description: 'Model(s) for Mistral provider (comma-separated)'
+    required: false
+    default: 'codestral-latest'
   pr-size-warn-lines:
     description: 'Changed source line threshold above which the review includes a PR size warning'
     required: false
@@ -99,6 +144,17 @@ runs:
         FALLBACK_OPENAI_BASE_URL: ${{ inputs.fallback-openai-base-url }}
         FALLBACK_OPENAI_API_KEY: ${{ inputs.fallback-openai-api-key }}
         FALLBACK_OPENAI_MODEL: ${{ inputs.fallback-openai-model }}
+        PROVIDER_ORDER: ${{ inputs.provider-order }}
+        ENABLE_GITHUB_MODELS: ${{ inputs.enable-github-models }}
+        GITHUB_MODELS_MODEL: ${{ inputs.github-models-model }}
+        GROQ_API_KEY: ${{ inputs.groq-api-key }}
+        GROQ_MODEL: ${{ inputs.groq-model }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        OPENROUTER_MODEL: ${{ inputs.openrouter-model }}
+        CEREBRAS_API_KEY: ${{ inputs.cerebras-api-key }}
+        CEREBRAS_MODEL: ${{ inputs.cerebras-model }}
+        MISTRAL_API_KEY: ${{ inputs.mistral-api-key }}
+        MISTRAL_MODEL: ${{ inputs.mistral-model }}
         PR_SIZE_WARN_LINES: ${{ inputs.pr-size-warn-lines }}
         PR_SIZE_WARN_FILES: ${{ inputs.pr-size-warn-files }}
         GH_TOKEN: ${{ inputs.github-token }}

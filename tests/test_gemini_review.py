@@ -173,7 +173,23 @@ class TestDiffParsingFilteringAndChunking(unittest.TestCase):
         self.assertEqual(omitted, ["d.py"])
 
 
-class TestMainEndToEnd(unittest.TestCase):
+_CLEAN_PROVIDER_ENV = {
+    "ENABLE_GITHUB_MODELS": "false",
+    "GH_TOKEN": "",
+    "GITHUB_TOKEN": "",
+    "GITHUB_MODELS_TOKEN": "",
+    "GROQ_API_KEY": "",
+    "OPENROUTER_API_KEY": "",
+    "CEREBRAS_API_KEY": "",
+    "MISTRAL_API_KEY": "",
+    "FALLBACK_OPENAI_BASE_URL": "",
+    "FALLBACK_OPENAI_API_KEY": "",
+    "FALLBACK_OPENAI_MODEL": "",
+    "PROVIDER_ORDER": gemini_review.DEFAULT_PROVIDER_ORDER,
+}
+
+
+class _MainRunnerMixin:
     def _run_main_in_tempdir(
         self,
         diff_text: str,
@@ -227,6 +243,7 @@ class TestMainEndToEnd(unittest.TestCase):
                 Path("pr_diff_stat.txt").write_text(" sample.py | 2 +\n", encoding="utf-8")
 
                 base_env = {
+                    **_CLEAN_PROVIDER_ENV,
                     "GEMINI_API_KEY": "AIzaSyDummyTestKey999",
                     "GEMINI_MODEL": "gemini-3.8-flash",
                     "GEMINI_FALLBACK_MODEL": "gemini-3.6-flash,gemini-3.5-flash-lite",
@@ -259,6 +276,8 @@ class TestMainEndToEnd(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+
+class TestMainEndToEnd(_MainRunnerMixin, unittest.TestCase):
     def test_single_shot_failover_and_timeout_ms(self):
         def responder(model: str, _contents: str):
             if model == "gemini-3.8-flash":
@@ -483,6 +502,167 @@ class TestPRSizeCallout(unittest.TestCase):
         self.assertNotIn("> [!NOTE]", delete_callout)
         self.assertNotIn("Compiled/bundled artifact", delete_callout)
         self.assertIn("> **PR Size:** `S`", delete_callout)
+
+
+def _make_urlopen_response(content: str):
+    fake_body = json.dumps({"choices": [{"message": {"content": content}}]}).encode("utf-8")
+    fake_resp = mock.MagicMock()
+    fake_resp.read.return_value = fake_body
+    fake_resp.__enter__.return_value = fake_resp
+    fake_resp.__exit__.return_value = False
+    return fake_resp
+
+
+def _make_http_error(url: str, code: int, body: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        url=url,
+        code=code,
+        msg="Error",
+        hdrs=None,
+        fp=io.BytesIO(body),
+    )
+
+
+class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.TestCase):
+    def test_build_provider_chain_defaults_and_custom_order(self):
+        env = {
+            "GEMINI_API_KEY": "AIza-test",
+            "ENABLE_GITHUB_MODELS": "true",
+            "GH_TOKEN": "ghs-test",
+            "GROQ_API_KEY": "gsk-test",
+            "OPENROUTER_API_KEY": "sk-or-test",
+            "CEREBRAS_API_KEY": "csk-test",
+            "MISTRAL_API_KEY": "msk-test",
+            "FALLBACK_OPENAI_BASE_URL": "https://custom.example/v1",
+            "FALLBACK_OPENAI_API_KEY": "cust-test",
+            "FALLBACK_OPENAI_MODEL": "custom-model-1, custom-model-2",
+        }
+        chain = gemini_review.build_provider_chain(env)
+        self.assertEqual(
+            [p.provider_id for p in chain],
+            ["gemini", "github-models", "groq", "openrouter", "cerebras", "mistral", "custom-openai"],
+        )
+        self.assertEqual(chain[1].base_url, "https://models.github.ai/inference")
+        self.assertEqual(chain[6].models, ("custom-model-1", "custom-model-2"))
+
+        reordered = gemini_review.build_provider_chain(
+            {**env, "PROVIDER_ORDER": "groq, github-models, openrouter"}
+        )
+        self.assertEqual(
+            [p.provider_id for p in reordered],
+            ["groq", "github-models", "openrouter", "gemini", "cerebras", "mistral", "custom-openai"],
+        )
+
+    def test_multi_provider_failover_gemini_to_github_models_to_groq(self):
+        def gemini_responder(_model: str, _contents: str):
+            raise RuntimeError("503 UNAVAILABLE")
+
+        seen_urls: list[str] = []
+
+        def fake_urlopen(req, timeout=60):
+            seen_urls.append(req.full_url)
+            if "models.github.ai" in req.full_url:
+                raise _make_http_error(req.full_url, 429, b"Rate limit exceeded")
+            return _make_urlopen_response("#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]")
+
+        env = {
+            "GEMINI_MAX_RETRIES": "1",
+            "ENABLE_GITHUB_MODELS": "true",
+            "GH_TOKEN": "ghs_test_token",
+            "GROQ_API_KEY": "gsk_test_token",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, _, calls = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150), env, gemini_responder
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://models.github.ai/inference/chat/completions",
+                "https://api.groq.com/openai/v1/chat/completions",
+            ],
+        )
+        self.assertEqual(action_txt, "approve")
+        self.assertIn("### AI Code Review (openai/gpt-oss-120b via Groq)", output_md)
+
+    def test_openrouter_multi_model_failover_within_provider(self):
+        seen_models: list[str] = []
+
+        def fake_urlopen(req, timeout=60):
+            payload = json.loads(req.data.decode("utf-8"))
+            seen_models.append(payload["model"])
+            if payload["model"] == "qwen/qwen3-coder:free":
+                raise _make_http_error(req.full_url, 429, b"Provider returned 429")
+            return _make_urlopen_response("#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]")
+
+        env = {
+            "GEMINI_API_KEY": "",
+            "GEMINI_MAX_RETRIES": "1",
+            "OPENROUTER_API_KEY": "sk-or-test-123",
+            "OPENROUTER_MODEL": "qwen/qwen3-coder:free,deepseek/deepseek-r1:free",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, client_kwargs, _ = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150), env, lambda _m, _c: ""
+            )
+
+        self.assertEqual(client_kwargs, [])
+        self.assertEqual(seen_models, ["qwen/qwen3-coder:free", "deepseek/deepseek-r1:free"])
+        self.assertEqual(action_txt, "approve")
+        self.assertIn("### AI Code Review (deepseek/deepseek-r1:free via OpenRouter)", output_md)
+
+    def test_keyless_gemini_with_github_models_only(self):
+        seen_auth: list[str] = []
+
+        def fake_urlopen(req, timeout=60):
+            seen_auth.append(req.get_header("Authorization"))
+            return _make_urlopen_response("#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]")
+
+        env = {
+            "GEMINI_API_KEY": "",
+            "ENABLE_GITHUB_MODELS": "true",
+            "GH_TOKEN": "ghs_test_token",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, client_kwargs, calls = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150), env, lambda _m, _c: ""
+            )
+
+        self.assertEqual(client_kwargs, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(seen_auth, ["Bearer ghs_test_token"])
+        self.assertEqual(action_txt, "approve")
+        self.assertIn("### AI Code Review (openai/gpt-4.1-mini via GitHub Models)", output_md)
+
+    def test_multi_provider_error_scrubs_all_provider_keys(self):
+        def gemini_responder(_model: str, _contents: str):
+            raise RuntimeError("503 UNAVAILABLE for AIzaSyDummyTestKey999")
+
+        def fake_urlopen(req, timeout=60):
+            raise _make_http_error(
+                req.full_url,
+                503,
+                b"Downstream error leaking ghs_secret_gh gsk_secret_groq sk-or-secret-or AIzaSyDummyTestKey999",
+            )
+
+        env = {
+            "GEMINI_MAX_RETRIES": "1",
+            "ENABLE_GITHUB_MODELS": "true",
+            "GH_TOKEN": "ghs_secret_gh",
+            "GROQ_API_KEY": "gsk_secret_groq",
+            "OPENROUTER_API_KEY": "sk-or-secret-or",
+        }
+        with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
+            output_md, action_txt, _, _ = self._run_main_in_tempdir(
+                _make_file_patch("app.py", 150), env, gemini_responder
+            )
+
+        self.assertEqual(action_txt, "comment")
+        for secret in ("AIzaSyDummyTestKey999", "ghs_secret_gh", "gsk_secret_groq", "sk-or-secret-or"):
+            self.assertNotIn(secret, output_md)
+        self.assertIn("***", output_md)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,17 @@ from google.genai import types
 MISSING_ISSUE_MARKER = "<!-- gemini-pr-reviewer:missing-issue -->"
 DEFAULT_PRIMARY_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite"
+DEFAULT_PROVIDER_ORDER = "gemini,github-models,groq,openrouter,cerebras,mistral,custom-openai"
+DEFAULT_GITHUB_MODELS_BASE_URL = "https://models.github.ai/inference"
+DEFAULT_GITHUB_MODELS_MODELS = "openai/gpt-4.1-mini"
+DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_MODELS = "openai/gpt-oss-120b,llama-3.3-70b-versatile"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENROUTER_MODELS = "qwen/qwen3-coder:free,deepseek/deepseek-r1:free"
+DEFAULT_CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+DEFAULT_CEREBRAS_MODELS = "llama-3.3-70b"
+DEFAULT_MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
+DEFAULT_MISTRAL_MODELS = "codestral-latest"
 
 DEFAULT_EXCLUDE_BASENAMES = frozenset(
     {
@@ -161,14 +172,27 @@ def is_transient_error(err_str: str) -> bool:
 is_transient_busy_error = is_transient_error
 
 
-def build_candidate_models(primary_model: str, fallback_models_raw: str) -> list[str]:
-    """Builds an ordered, deduplicated list of candidate models from primary and comma-separated fallbacks."""
-    raw_items = [primary_model] + str(fallback_models_raw or "").split(",")
+def _dedupe_models(raw_items: list[str]) -> list[str]:
+    """Trims and deduplicates model names while preserving order."""
     candidates: list[str] = []
     for item in raw_items:
         model = item.strip()
         if model and model not in candidates:
             candidates.append(model)
+    return candidates
+
+
+def parse_model_list(raw_models: str, default_models: str = "") -> list[str]:
+    """Parses a comma-separated model list, falling back to default_models when empty."""
+    parsed = _dedupe_models(str(raw_models or "").split(","))
+    if parsed:
+        return parsed
+    return _dedupe_models(str(default_models or "").split(",")) if default_models else []
+
+
+def build_candidate_models(primary_model: str, fallback_models_raw: str) -> list[str]:
+    """Builds an ordered, deduplicated list of candidate models from primary and comma-separated fallbacks."""
+    candidates = _dedupe_models([primary_model] + str(fallback_models_raw or "").split(","))
     return candidates or [DEFAULT_PRIMARY_MODEL]
 
 
@@ -701,6 +725,139 @@ class OpenAIFallbackConfig:
         return bool(self.base_url.strip() and self.api_key.strip() and self.model.strip())
 
 
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Configuration for an AI review provider (Gemini or OpenAI-compatible)."""
+
+    provider_id: str
+    display_name: str
+    kind: str  # "gemini" or "openai"
+    api_key: str
+    models: tuple[str, ...]
+    base_url: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        if not self.api_key.strip() or not self.models:
+            return False
+        if self.kind == "openai" and not self.base_url.strip():
+            return False
+        return True
+
+
+def build_provider_chain(
+    env: dict[str, str] | None = None,
+    openai_fallback: OpenAIFallbackConfig | None = None,
+) -> list[ProviderSpec]:
+    """Builds the ordered list of enabled AI review providers from environment variables."""
+    source_env = os.environ if env is None else env
+    available: dict[str, ProviderSpec] = {}
+
+    available["gemini"] = ProviderSpec(
+        provider_id="gemini",
+        display_name="Google AI Studio",
+        kind="gemini",
+        api_key=source_env.get("GEMINI_API_KEY", "").strip(),
+        models=tuple(
+            build_candidate_models(
+                source_env.get("GEMINI_MODEL", DEFAULT_PRIMARY_MODEL),
+                source_env.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODELS),
+            )
+        ),
+    )
+
+    gh_models_enabled = source_env.get("ENABLE_GITHUB_MODELS", "").strip().lower() in ("true", "1", "yes")
+    gh_models_key = (
+        (
+            source_env.get("GITHUB_MODELS_TOKEN")
+            or source_env.get("GH_TOKEN")
+            or source_env.get("GITHUB_TOKEN")
+            or ""
+        ).strip()
+        if gh_models_enabled
+        else ""
+    )
+    available["github-models"] = ProviderSpec(
+        provider_id="github-models",
+        display_name="GitHub Models",
+        kind="openai",
+        api_key=gh_models_key,
+        base_url=source_env.get("GITHUB_MODELS_BASE_URL", DEFAULT_GITHUB_MODELS_BASE_URL).strip()
+        or DEFAULT_GITHUB_MODELS_BASE_URL,
+        models=tuple(parse_model_list(source_env.get("GITHUB_MODELS_MODEL", ""), DEFAULT_GITHUB_MODELS_MODELS)),
+    )
+
+    preset_defs = (
+        ("groq", "Groq", "GROQ_API_KEY", "GROQ_BASE_URL", DEFAULT_GROQ_BASE_URL, "GROQ_MODEL", DEFAULT_GROQ_MODELS),
+        (
+            "openrouter",
+            "OpenRouter",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_BASE_URL",
+            DEFAULT_OPENROUTER_BASE_URL,
+            "OPENROUTER_MODEL",
+            DEFAULT_OPENROUTER_MODELS,
+        ),
+        (
+            "cerebras",
+            "Cerebras",
+            "CEREBRAS_API_KEY",
+            "CEREBRAS_BASE_URL",
+            DEFAULT_CEREBRAS_BASE_URL,
+            "CEREBRAS_MODEL",
+            DEFAULT_CEREBRAS_MODELS,
+        ),
+        (
+            "mistral",
+            "Mistral",
+            "MISTRAL_API_KEY",
+            "MISTRAL_BASE_URL",
+            DEFAULT_MISTRAL_BASE_URL,
+            "MISTRAL_MODEL",
+            DEFAULT_MISTRAL_MODELS,
+        ),
+    )
+    for pid, display, key_env, base_env, default_base, model_env, default_models in preset_defs:
+        available[pid] = ProviderSpec(
+            provider_id=pid,
+            display_name=display,
+            kind="openai",
+            api_key=source_env.get(key_env, "").strip(),
+            base_url=source_env.get(base_env, default_base).strip() or default_base,
+            models=tuple(parse_model_list(source_env.get(model_env, ""), default_models)),
+        )
+
+    custom_cfg = (
+        openai_fallback
+        if openai_fallback is not None
+        else OpenAIFallbackConfig(
+            base_url=source_env.get("FALLBACK_OPENAI_BASE_URL", ""),
+            api_key=source_env.get("FALLBACK_OPENAI_API_KEY", ""),
+            model=source_env.get("FALLBACK_OPENAI_MODEL", ""),
+        )
+    )
+    available["custom-openai"] = ProviderSpec(
+        provider_id="custom-openai",
+        display_name="OpenAI-compatible fallback",
+        kind="openai",
+        api_key=custom_cfg.api_key.strip(),
+        base_url=custom_cfg.base_url.strip(),
+        models=tuple(parse_model_list(custom_cfg.model)),
+    )
+
+    raw_order = source_env.get("PROVIDER_ORDER", DEFAULT_PROVIDER_ORDER)
+    requested_order: list[str] = []
+    for item in str(raw_order or "").split(","):
+        pid = item.strip().lower()
+        if pid and pid not in requested_order:
+            requested_order.append(pid)
+    for pid in DEFAULT_PROVIDER_ORDER.split(","):
+        if pid not in requested_order:
+            requested_order.append(pid)
+
+    return [available[pid] for pid in requested_order if pid in available and available[pid].enabled]
+
+
 def attempt_openai_compatible_review(
     cfg: OpenAIFallbackConfig, prompt: str, system_instruction: str, timeout_sec: int
 ) -> str:
@@ -751,8 +908,17 @@ def attempt_openai_compatible_review(
     return content or "No review generated."
 
 
+def _format_provider_model_label(provider: ProviderSpec, model: str) -> str:
+    """Formats the model attribution label returned by invoke_with_fallback."""
+    if provider.kind == "gemini":
+        return model
+    if provider.provider_id == "custom-openai":
+        return f"{model} (OpenAI-compatible fallback)"
+    return f"{model} via {provider.display_name}"
+
+
 def invoke_with_fallback(
-    client: genai.Client,
+    client: genai.Client | None,
     candidate_models: list[str],
     prompt: str,
     system_instruction: str,
@@ -761,74 +927,130 @@ def invoke_with_fallback(
     api_key: str = "",
     request_timeout_sec: int = 60,
     openai_fallback: OpenAIFallbackConfig | None = None,
+    providers: list[ProviderSpec] | None = None,
 ) -> tuple[str | None, str, str]:
-    """Invokes candidate Gemini models in order, then optional OpenAI-compatible fallback."""
-    per_model_attempts = (
-        max(1, min(2, max_retries)) if len(candidate_models) > 1 else max(1, max_retries)
-    )
-    used_model = candidate_models[0]
-    last_err = ""
-    extra_secrets = (openai_fallback.api_key,) if openai_fallback and openai_fallback.api_key else ()
-
-    for model_idx, current_model in enumerate(candidate_models):
-        used_model = current_model
-        print(f"Attempting review with model: {current_model}")
-
-        fatal_auth = False
-        for attempt in range(1, per_model_attempts + 1):
-            print(f"[{attempt}/{per_model_attempts}] Sending review request to {current_model} via Google AI Studio...")
-            try:
-                text = attempt_review(client, current_model, prompt, system_instruction)
-                return text, current_model, ""
-            except Exception as e:
-                sanitized = sanitize_error(str(e), api_key, *extra_secrets)
-                last_err = sanitized
-
-                if is_fatal_auth_error(sanitized):
-                    print(f"Fatal authentication/permission error on {current_model}: {sanitized}")
-                    if not (openai_fallback and openai_fallback.enabled):
-                        return None, current_model, sanitized
-                    fatal_auth = True
-                    break
-
-                if is_model_unavailable_error(sanitized):
-                    print(f"Model {current_model} unavailable ({sanitized}). Failing over immediately...")
-                    break
-
-                if is_transient_error(sanitized):
-                    if attempt < per_model_attempts:
-                        delay = min(base_delay * attempt, 90)
-                        print(
-                            f"Transient error on {current_model} ({sanitized}). "
-                            f"Waiting {delay}s before retry ({attempt}/{per_model_attempts})..."
-                        )
-                        time.sleep(delay)
-                    else:
-                        print(f"Exhausted retries on {current_model} ({sanitized}).")
-                else:
-                    print(f"Non-transient error on {current_model} ({sanitized}).")
-                    break
-
-        if fatal_auth:
-            break
-        if model_idx < len(candidate_models) - 1:
-            print(f"Switching to fallback model: {candidate_models[model_idx + 1]}...")
-
-    if openai_fallback and openai_fallback.enabled:
-        host = urllib.parse.urlparse(openai_fallback.base_url.strip()).netloc or "custom-endpoint"
-        print(
-            f"All Gemini models failed; trying OpenAI-compatible fallback "
-            f"({host}, model={openai_fallback.model.strip()})..."
-        )
-        try:
-            fallback_text = attempt_openai_compatible_review(
-                openai_fallback, prompt, system_instruction, request_timeout_sec
+    """Invokes candidate models across configured providers in priority order."""
+    if providers is None:
+        active_providers: list[ProviderSpec] = []
+        if client is not None or api_key:
+            active_providers.append(
+                ProviderSpec(
+                    provider_id="gemini",
+                    display_name="Google AI Studio",
+                    kind="gemini",
+                    api_key=api_key,
+                    models=tuple(candidate_models),
+                )
             )
-            return fallback_text, f"{openai_fallback.model.strip()} (OpenAI-compatible fallback)", ""
-        except Exception as e:
-            sanitized_oai = sanitize_error(str(e), api_key, openai_fallback.api_key)
-            print(f"OpenAI-compatible fallback failed ({sanitized_oai}).")
-            last_err = sanitized_oai
+        if openai_fallback and openai_fallback.enabled:
+            active_providers.append(
+                ProviderSpec(
+                    provider_id="custom-openai",
+                    display_name="OpenAI-compatible fallback",
+                    kind="openai",
+                    api_key=openai_fallback.api_key.strip(),
+                    base_url=openai_fallback.base_url.strip(),
+                    models=tuple(parse_model_list(openai_fallback.model)),
+                )
+            )
+    else:
+        active_providers = list(providers)
+
+    if not active_providers:
+        fallback_name = candidate_models[0] if candidate_models else DEFAULT_PRIMARY_MODEL
+        return None, fallback_name, "No AI review provider configured."
+
+    secrets_list: list[str] = []
+    for secret in [
+        api_key,
+        openai_fallback.api_key if openai_fallback else "",
+        *(p.api_key for p in active_providers),
+    ]:
+        if secret and secret not in secrets_list:
+            secrets_list.append(secret)
+
+    total_candidate_count = sum(len(p.models) for p in active_providers)
+    per_model_attempts = (
+        max(1, min(2, max_retries)) if total_candidate_count > 1 else max(1, max_retries)
+    )
+    used_model = _format_provider_model_label(active_providers[0], active_providers[0].models[0])
+    last_err = ""
+
+    for provider_idx, provider in enumerate(active_providers):
+        fatal_auth = False
+        for model_idx, current_model in enumerate(provider.models):
+            used_model = _format_provider_model_label(provider, current_model)
+            print(f"Attempting review with model: {current_model} ({provider.display_name})")
+
+            for attempt in range(1, per_model_attempts + 1):
+                print(
+                    f"[{attempt}/{per_model_attempts}] Sending review request to {current_model} "
+                    f"via {provider.display_name}..."
+                )
+                try:
+                    if provider.kind == "gemini":
+                        if client is None:
+                            raise RuntimeError("Gemini client is not initialized.")
+                        text = attempt_review(client, current_model, prompt, system_instruction)
+                    else:
+                        cfg = OpenAIFallbackConfig(
+                            base_url=provider.base_url,
+                            api_key=provider.api_key,
+                            model=current_model,
+                        )
+                        text = attempt_openai_compatible_review(
+                            cfg, prompt, system_instruction, request_timeout_sec
+                        )
+                    return text, used_model, ""
+                except Exception as e:
+                    sanitized = sanitize_error(str(e), *secrets_list)
+                    last_err = sanitized
+
+                    if is_fatal_auth_error(sanitized):
+                        print(
+                            f"Fatal authentication/permission error on {provider.display_name} "
+                            f"({current_model}): {sanitized}"
+                        )
+                        if provider_idx >= len(active_providers) - 1:
+                            return None, used_model, sanitized
+                        fatal_auth = True
+                        break
+
+                    if is_model_unavailable_error(sanitized):
+                        print(
+                            f"Model {current_model} unavailable on {provider.display_name} "
+                            f"({sanitized}). Failing over immediately..."
+                        )
+                        break
+
+                    if is_transient_error(sanitized):
+                        if attempt < per_model_attempts:
+                            delay = min(base_delay * attempt, 90)
+                            print(
+                                f"Transient error on {current_model} ({sanitized}). "
+                                f"Waiting {delay}s before retry ({attempt}/{per_model_attempts})..."
+                            )
+                            time.sleep(delay)
+                        else:
+                            print(f"Exhausted retries on {current_model} ({sanitized}).")
+                    else:
+                        print(f"Non-transient error on {current_model} ({sanitized}).")
+                        break
+
+            if fatal_auth:
+                break
+            if model_idx < len(provider.models) - 1:
+                print(
+                    f"Switching to fallback model: {provider.models[model_idx + 1]} "
+                    f"({provider.display_name})..."
+                )
+
+        if provider_idx < len(active_providers) - 1:
+            next_provider = active_providers[provider_idx + 1]
+            print(
+                f"Switching to fallback provider: {next_provider.display_name} "
+                f"({next_provider.models[0]})..."
+            )
 
     return None, used_model, last_err
 
@@ -876,7 +1098,7 @@ def build_issue_context_and_rule(
 
 
 def run_chunked_review(
-    client: genai.Client,
+    client: genai.Client | None,
     candidate_models: list[str],
     chunks: list[list[tuple[str, str]]],
     omitted_files: list[str],
@@ -891,6 +1113,7 @@ def run_chunked_review(
     chunk_pause: int,
     request_timeout_sec: int = 60,
     openai_fallback: OpenAIFallbackConfig | None = None,
+    providers: list[ProviderSpec] | None = None,
 ) -> tuple[str | None, str, str]:
     """Runs Map-Reduce review across file-boundary chunks and synthesizes one final verdict."""
     chunk_system_instruction = (
@@ -904,7 +1127,11 @@ def run_chunked_review(
 
     chunk_notes: list[str] = []
     failed_notes: list[str] = []
-    last_model = candidate_models[0]
+    last_model = (
+        candidate_models[0]
+        if candidate_models
+        else (providers[0].models[0] if providers else DEFAULT_PRIMARY_MODEL)
+    )
     last_err = ""
 
     for idx, chunk_files in enumerate(chunks, start=1):
@@ -934,6 +1161,7 @@ def run_chunked_review(
             api_key=api_key,
             request_timeout_sec=request_timeout_sec,
             openai_fallback=openai_fallback,
+            providers=providers,
         )
         last_model = chunk_model
         if chunk_text is None:
@@ -995,7 +1223,16 @@ Synthesize the chunk findings below into a single coherent code review against t
         api_key=api_key,
         request_timeout_sec=request_timeout_sec,
         openai_fallback=openai_fallback,
+        providers=providers,
     )
+
+
+def format_review_header(used_model: str, chunk_count: int = 0) -> str:
+    """Builds the markdown header attributing the model and provider used for review."""
+    header_suffix = f" · {chunk_count}-chunk review" if chunk_count > 1 else ""
+    if "(OpenAI-compatible fallback)" in used_model or " via " in used_model:
+        return f"### AI Code Review ({used_model}{header_suffix})\n\n"
+    return f"### AI Code Review ({used_model} via Google AI Studio{header_suffix})\n\n"
 
 
 def resolve_review_action(review_text: str) -> str:
@@ -1016,14 +1253,6 @@ def write_review_outputs(output_body: str, review_action: str) -> None:
 
 
 def main():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Missing GEMINI_API_KEY environment variable.")
-        sys.exit(1)
-
-    primary_model = os.environ.get("GEMINI_MODEL", DEFAULT_PRIMARY_MODEL)
-    fallback_models_raw = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODELS)
-    candidate_models = build_candidate_models(primary_model, fallback_models_raw)
     max_retries = int(os.environ.get("GEMINI_MAX_RETRIES", "1"))
     base_delay = int(os.environ.get("GEMINI_RETRY_DELAY", "10"))
     request_timeout_sec = max(10, int(os.environ.get("GEMINI_REQUEST_TIMEOUT", "60")))
@@ -1039,6 +1268,18 @@ def main():
         api_key=os.environ.get("FALLBACK_OPENAI_API_KEY", ""),
         model=os.environ.get("FALLBACK_OPENAI_MODEL", ""),
     )
+    providers = build_provider_chain(openai_fallback=openai_fallback)
+    if not providers:
+        print(
+            "No AI review provider configured. Provide GEMINI_API_KEY, set ENABLE_GITHUB_MODELS=true "
+            "(with GH_TOKEN/GITHUB_TOKEN), or configure GROQ_API_KEY, OPENROUTER_API_KEY, "
+            "CEREBRAS_API_KEY, MISTRAL_API_KEY, or FALLBACK_OPENAI_*."
+        )
+        sys.exit(1)
+
+    gemini_provider = next((p for p in providers if p.kind == "gemini"), None)
+    api_key = gemini_provider.api_key if gemini_provider else ""
+    candidate_models = list(gemini_provider.models) if gemini_provider else list(providers[0].models)
 
     diff_path = os.environ.get("DIFF_FILE", "pr_diff.txt")
     diff_stat_path = os.environ.get("DIFF_STAT_FILE", "pr_diff_stat.txt")
@@ -1150,9 +1391,13 @@ def main():
     pr_body = (pr_context.get("body") or "").strip() or "(No PR description provided)"
 
     # HttpOptions.timeout in google-genai is in milliseconds.
-    client = genai.Client(
-        api_key=api_key,
-        http_options={"api_version": "v1beta", "timeout": request_timeout_sec * 1000},
+    client = (
+        genai.Client(
+            api_key=api_key,
+            http_options={"api_version": "v1beta", "timeout": request_timeout_sec * 1000},
+        )
+        if gemini_provider is not None
+        else None
     )
 
     chunk_count = 0
@@ -1179,6 +1424,7 @@ def main():
             chunk_pause=chunk_pause,
             request_timeout_sec=request_timeout_sec,
             openai_fallback=openai_fallback,
+            providers=providers,
         )
     else:
         overview_section = f"\n{diff_overview}\n" if diff_overview else ""
@@ -1208,20 +1454,20 @@ def main():
             api_key=api_key,
             request_timeout_sec=request_timeout_sec,
             openai_fallback=openai_fallback,
+            providers=providers,
         )
 
     api_succeeded = review_text is not None
     if not api_succeeded:
-        if is_fatal_auth_error(last_err) and not openai_fallback.enabled:
+        if is_fatal_auth_error(last_err) and len(providers) == 1:
+            cred_hint = "GEMINI_API_KEY" if providers[0].kind == "gemini" else f"{providers[0].display_name} credentials"
             review_text = (
                 f"> [!WARNING]\n"
                 f"> Automated AI review failed due to authentication or permissions ({last_err}). "
-                f"Please verify `GEMINI_API_KEY` and proceed with manual review."
+                f"Please verify `{cred_hint}` and proceed with manual review."
             )
         else:
-            tested = list(candidate_models)
-            if openai_fallback.enabled:
-                tested.append(openai_fallback.model.strip())
+            tested = [m for p in providers for m in p.models]
             err_detail = f" Last error: `{last_err}`." if last_err else ""
             review_text = (
                 f"> [!WARNING]\n"
@@ -1243,11 +1489,7 @@ def main():
     else:
         review_action = "comment"
 
-    header_suffix = f" · {chunk_count}-chunk review" if chunk_count > 1 else ""
-    if "(OpenAI-compatible fallback)" in used_model:
-        header = f"### AI Code Review ({used_model}{header_suffix})\n\n"
-    else:
-        header = f"### AI Code Review ({used_model} via Google AI Studio{header_suffix})\n\n"
+    header = format_review_header(used_model, chunk_count)
 
     size_prefix = f"{pr_size_callout}\n\n" if pr_size_callout else ""
     write_review_outputs(header + size_prefix + review_text, review_action)

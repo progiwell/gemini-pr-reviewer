@@ -16,7 +16,6 @@ jobs:
       contents: read
       issues: read
       pull-requests: write
-      models: read
 
     steps:
       - name: Checkout Repository
@@ -27,6 +26,5 @@ jobs:
       - name: Gemini AI Review
         uses: ./
         with:
-          enable-github-models: 'true'
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}

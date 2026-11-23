@@ -52,15 +52,7 @@ inputs:
   provider-order:
     description: 'Comma-separated priority order across enabled AI providers'
     required: false
-    default: 'gemini,github-models,groq,openrouter,cerebras,mistral,custom-openai'
-  enable-github-models:
-    description: 'Enable GitHub Models free tier using github-token (requires permissions: models: read)'
-    required: false
-    default: 'false'
-  github-models-model:
-    description: 'Model(s) for GitHub Models provider (comma-separated)'
-    required: false
-    default: 'openai/gpt-4.1-mini'
+    default: 'gemini,groq,openrouter,cerebras,mistral,custom-openai'
   groq-api-key:
     description: 'Optional Groq API key for free-tier review/fallback'
     required: false
@@ -165,8 +157,6 @@ runs:
         FALLBACK_OPENAI_API_KEY: ${{ inputs.fallback-openai-api-key }}
         FALLBACK_OPENAI_MODEL: ${{ inputs.fallback-openai-model }}
         PROVIDER_ORDER: ${{ inputs.provider-order }}
-        ENABLE_GITHUB_MODELS: ${{ inputs.enable-github-models }}
-        GITHUB_MODELS_MODEL: ${{ inputs.github-models-model }}
         GROQ_API_KEY: ${{ inputs.groq-api-key }}
         GROQ_MODEL: ${{ inputs.groq-model }}
         OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}

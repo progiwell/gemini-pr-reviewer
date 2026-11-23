@@ -646,6 +646,24 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
         self.assertEqual(action_txt, "approve")
         self.assertIn("### AI Code Review (openai/gpt-oss-120b via Groq)", output_md)
 
+    def test_no_provider_configured_writes_warning_comment_without_crashing(self):
+        env = {
+            "GEMINI_API_KEY": "",
+            "GROQ_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
+            "CEREBRAS_API_KEY": "",
+            "MISTRAL_API_KEY": "",
+            "FALLBACK_OPENAI_BASE_URL": "",
+            "FALLBACK_OPENAI_API_KEY": "",
+            "FALLBACK_OPENAI_MODEL": "",
+        }
+        output_md, action_txt, client_kwargs, calls = self._run_main_in_tempdir(
+            _make_file_patch("app.py", 150), env, lambda _m, _c: ""
+        )
+        self.assertEqual(action_txt, "comment")
+        self.assertIn("No AI review provider configured", output_md)
+        self.assertIn("Please configure `GEMINI_API_KEY`", output_md)
+
     def test_multi_provider_error_scrubs_all_provider_keys(self):
         def gemini_responder(_model: str, _contents: str):
             raise RuntimeError("503 UNAVAILABLE for AIzaSyDummyTestKey999")

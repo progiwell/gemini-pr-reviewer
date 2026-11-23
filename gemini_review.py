@@ -2043,7 +2043,14 @@ def main():
             "GROQ_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY, MISTRAL_API_KEY, "
             "or FALLBACK_OPENAI_*."
         )
-        sys.exit(1)
+        msg = (
+            "> [!WARNING]\n"
+            "> Automated AI review skipped: No AI review provider configured.\n"
+            "> Please configure `GEMINI_API_KEY` (or `GROQ_API_KEY`, `OPENROUTER_API_KEY`, "
+            "`CEREBRAS_API_KEY`, `MISTRAL_API_KEY`) in repository secrets."
+        )
+        write_review_outputs(msg, "comment")
+        return
 
     gemini_provider = next((p for p in providers if p.kind == "gemini"), None)
     api_key = gemini_provider.api_key if gemini_provider else ""

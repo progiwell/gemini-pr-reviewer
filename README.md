@@ -60,7 +60,6 @@ You can combine Google Gemini with built-in free AI provider presets (**GitHub M
       contents: read
       issues: read
       pull-requests: write
-      models: read   # Required only when enable-github-models is 'true'
 
     steps:
       - name: Checkout Repository
@@ -74,9 +73,8 @@ You can combine Google Gemini with built-in free AI provider presets (**GitHub M
           main-reviewers: '2'              # Default: 2 independent main reviewers
           extra-providers-mode: 'fallback' # 'fallback' (default) or 'subagents'
           inline-comments: 'true'          # Default: exact line-by-line diff comments
-          provider-order: 'gemini,github-models,groq,openrouter,cerebras,mistral'
+          provider-order: 'gemini,groq,openrouter,cerebras,mistral'
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }} # optional if another provider is enabled
-          enable-github-models: 'true'                  # uses GITHUB_TOKEN (zero extra secret)
           groq-api-key: ${{ secrets.GROQ_API_KEY }}
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           cerebras-api-key: ${{ secrets.CEREBRAS_API_KEY }}
@@ -112,11 +110,9 @@ The reviewer automatically detects linked issues from any of the following forma
 | `inline-comments` | Enable exact line-by-line inline PR diff review comments | `true` | No |
 | `review-mode` | Multi-provider mode: `fallback`, `subagents`, `consensus`, or `parallel` | `fallback` | No |
 | `consensus-max-providers` | Max number of enabled providers queried in `consensus` mode | `3` | No |
-| `provider-order` | Comma-separated priority order across enabled AI providers | `gemini,github-models,groq,openrouter,cerebras,mistral,custom-openai` | No |
+| `provider-order` | Comma-separated priority order across enabled AI providers | `gemini,groq,openrouter,cerebras,mistral,custom-openai` | No |
 | `primary-model` | Primary Gemini model to query | `gemini-3.8-flash` | No |
 | `fallback-model` | Fallback Gemini model(s) when primary is congested (comma-separated) | `gemini-3.6-flash,gemini-3.5-flash-lite` | No |
-| `enable-github-models` | Enable GitHub Models free tier via `github-token` (`models: read`) | `false` | No |
-| `github-models-model` | Model(s) for GitHub Models provider (comma-separated) | `openai/gpt-4.1-mini` | No |
 | `groq-api-key` | Optional Groq API key for free-tier review/fallback | `''` | No |
 | `groq-model` | Model(s) for Groq provider (comma-separated) | `openai/gpt-oss-120b,llama-3.3-70b-versatile` | No |
 | `openrouter-api-key` | Optional OpenRouter API key for `:free` models | `''` | No |

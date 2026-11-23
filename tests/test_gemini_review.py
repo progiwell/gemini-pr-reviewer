@@ -174,10 +174,8 @@ class TestDiffParsingFilteringAndChunking(unittest.TestCase):
 
 
 _CLEAN_PROVIDER_ENV = {
-    "ENABLE_GITHUB_MODELS": "false",
     "GH_TOKEN": "",
     "GITHUB_TOKEN": "",
-    "GITHUB_MODELS_TOKEN": "",
     "GROQ_API_KEY": "",
     "OPENROUTER_API_KEY": "",
     "CEREBRAS_API_KEY": "",
@@ -542,8 +540,6 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
     def test_build_provider_chain_defaults_and_custom_order(self):
         env = {
             "GEMINI_API_KEY": "AIza-test",
-            "ENABLE_GITHUB_MODELS": "true",
-            "GH_TOKEN": "ghs-test",
             "GROQ_API_KEY": "gsk-test",
             "OPENROUTER_API_KEY": "sk-or-test",
             "CEREBRAS_API_KEY": "csk-test",
@@ -555,20 +551,20 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
         chain = gemini_review.build_provider_chain(env)
         self.assertEqual(
             [p.provider_id for p in chain],
-            ["gemini", "github-models", "groq", "openrouter", "cerebras", "mistral", "custom-openai"],
+            ["gemini", "groq", "openrouter", "cerebras", "mistral", "custom-openai"],
         )
-        self.assertEqual(chain[1].base_url, "https://models.github.ai/inference")
-        self.assertEqual(chain[6].models, ("custom-model-1", "custom-model-2"))
+        self.assertEqual(chain[1].base_url, "https://api.groq.com/openai/v1")
+        self.assertEqual(chain[5].models, ("custom-model-1", "custom-model-2"))
 
         reordered = gemini_review.build_provider_chain(
-            {**env, "PROVIDER_ORDER": "groq, github-models, openrouter"}
+            {**env, "PROVIDER_ORDER": "groq, openrouter, cerebras"}
         )
         self.assertEqual(
             [p.provider_id for p in reordered],
-            ["groq", "github-models", "openrouter", "gemini", "cerebras", "mistral", "custom-openai"],
+            ["groq", "openrouter", "cerebras", "gemini", "mistral", "custom-openai"],
         )
 
-    def test_multi_provider_failover_gemini_to_github_models_to_groq(self):
+    def test_multi_provider_failover_gemini_to_groq_to_openrouter(self):
         def gemini_responder(_model: str, _contents: str):
             raise RuntimeError("503 UNAVAILABLE")
 
@@ -576,15 +572,15 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
 
         def fake_urlopen(req, timeout=60):
             seen_urls.append(req.full_url)
-            if "models.github.ai" in req.full_url:
+            if "api.groq.com" in req.full_url:
                 raise _make_http_error(req.full_url, 429, b"Rate limit exceeded")
             return _make_urlopen_response("#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]")
 
         env = {
             "GEMINI_MAX_RETRIES": "1",
-            "ENABLE_GITHUB_MODELS": "true",
-            "GH_TOKEN": "ghs_test_token",
             "GROQ_API_KEY": "gsk_test_token",
+            "GROQ_MODEL": "openai/gpt-oss-120b",
+            "OPENROUTER_API_KEY": "sk-or-test-token",
         }
         with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
             output_md, action_txt, _, calls = self._run_main_in_tempdir(
@@ -595,12 +591,12 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
         self.assertEqual(
             seen_urls,
             [
-                "https://models.github.ai/inference/chat/completions",
                 "https://api.groq.com/openai/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
             ],
         )
         self.assertEqual(action_txt, "approve")
-        self.assertIn("### AI Code Review (openai/gpt-oss-120b via Groq)", output_md)
+        self.assertIn("### AI Code Review (qwen/qwen3-coder:free via OpenRouter)", output_md)
 
     def test_openrouter_multi_model_failover_within_provider(self):
         seen_models: list[str] = []
@@ -628,7 +624,7 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
         self.assertEqual(action_txt, "approve")
         self.assertIn("### AI Code Review (deepseek/deepseek-r1:free via OpenRouter)", output_md)
 
-    def test_keyless_gemini_with_github_models_only(self):
+    def test_keyless_gemini_with_groq_only(self):
         seen_auth: list[str] = []
 
         def fake_urlopen(req, timeout=60):
@@ -637,8 +633,7 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
 
         env = {
             "GEMINI_API_KEY": "",
-            "ENABLE_GITHUB_MODELS": "true",
-            "GH_TOKEN": "ghs_test_token",
+            "GROQ_API_KEY": "gsk_test_token",
         }
         with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
             output_md, action_txt, client_kwargs, calls = self._run_main_in_tempdir(
@@ -647,9 +642,27 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
 
         self.assertEqual(client_kwargs, [])
         self.assertEqual(calls, [])
-        self.assertEqual(seen_auth, ["Bearer ghs_test_token"])
+        self.assertEqual(seen_auth, ["Bearer gsk_test_token"])
         self.assertEqual(action_txt, "approve")
-        self.assertIn("### AI Code Review (openai/gpt-4.1-mini via GitHub Models)", output_md)
+        self.assertIn("### AI Code Review (openai/gpt-oss-120b via Groq)", output_md)
+
+    def test_no_provider_configured_writes_warning_comment_without_crashing(self):
+        env = {
+            "GEMINI_API_KEY": "",
+            "GROQ_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
+            "CEREBRAS_API_KEY": "",
+            "MISTRAL_API_KEY": "",
+            "FALLBACK_OPENAI_BASE_URL": "",
+            "FALLBACK_OPENAI_API_KEY": "",
+            "FALLBACK_OPENAI_MODEL": "",
+        }
+        output_md, action_txt, client_kwargs, calls = self._run_main_in_tempdir(
+            _make_file_patch("app.py", 150), env, lambda _m, _c: ""
+        )
+        self.assertEqual(action_txt, "comment")
+        self.assertIn("No AI review provider configured", output_md)
+        self.assertIn("Please configure `GEMINI_API_KEY`", output_md)
 
     def test_multi_provider_error_scrubs_all_provider_keys(self):
         def gemini_responder(_model: str, _contents: str):
@@ -659,13 +672,12 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
             raise _make_http_error(
                 req.full_url,
                 503,
-                b"Downstream error leaking ghs_secret_gh gsk_secret_groq sk-or-secret-or AIzaSyDummyTestKey999",
+                b"Downstream error leaking csk_secret_cerebras gsk_secret_groq sk-or-secret-or AIzaSyDummyTestKey999",
             )
 
         env = {
             "GEMINI_MAX_RETRIES": "1",
-            "ENABLE_GITHUB_MODELS": "true",
-            "GH_TOKEN": "ghs_secret_gh",
+            "CEREBRAS_API_KEY": "csk_secret_cerebras",
             "GROQ_API_KEY": "gsk_secret_groq",
             "OPENROUTER_API_KEY": "sk-or-secret-or",
         }
@@ -675,7 +687,7 @@ class TestProviderRegistryAndMultiProviderFallback(_MainRunnerMixin, unittest.Te
             )
 
         self.assertEqual(action_txt, "comment")
-        for secret in ("AIzaSyDummyTestKey999", "ghs_secret_gh", "gsk_secret_groq", "sk-or-secret-or"):
+        for secret in ("AIzaSyDummyTestKey999", "csk_secret_cerebras", "gsk_secret_groq", "sk-or-secret-or"):
             self.assertNotIn(secret, output_md)
         self.assertIn("***", output_md)
 
@@ -691,7 +703,7 @@ class TestConsensusAndParallelModes(_MainRunnerMixin, unittest.TestCase):
 
         def fake_urlopen(req, timeout=60):
             seen_urls.append(req.full_url)
-            if "models.github.ai" in req.full_url:
+            if "api.groq.com" in req.full_url:
                 return _make_urlopen_response("Found missing edge case test.\n\n[CHANGES_REQUESTED]")
             return _make_urlopen_response("Looks solid overall.\n\n[APPROVED]")
 
@@ -699,9 +711,8 @@ class TestConsensusAndParallelModes(_MainRunnerMixin, unittest.TestCase):
             "GEMINI_MAX_RETRIES": "1",
             "REVIEW_MODE": "consensus",
             "CONSENSUS_MAX_PROVIDERS": "3",
-            "ENABLE_GITHUB_MODELS": "true",
-            "GH_TOKEN": "ghs_test_token",
             "GROQ_API_KEY": "gsk_test_token",
+            "OPENROUTER_API_KEY": "sk-or-test-token",
         }
         with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
             output_md, action_txt, _, calls = self._run_main_in_tempdir(
@@ -713,8 +724,8 @@ class TestConsensusAndParallelModes(_MainRunnerMixin, unittest.TestCase):
         self.assertEqual(
             seen_urls,
             [
-                "https://models.github.ai/inference/chat/completions",
                 "https://api.groq.com/openai/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
             ],
         )
         self.assertIn("#### 🤝 Multi-Provider Consensus Summary", output_md)
@@ -786,9 +797,9 @@ class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.Tes
 
         def fake_urlopen(req, timeout=60):
             seen_urls.append(req.full_url)
-            if "models.github.ai" in req.full_url:
-                raise _make_http_error(req.full_url, 429, b"Rate limit exceeded")
             if "api.groq.com" in req.full_url:
+                raise _make_http_error(req.full_url, 429, b"Rate limit exceeded")
+            if "openrouter.ai" in req.full_url:
                 return _make_urlopen_response("Needs null check.\n\n[CHANGES_REQUESTED]")
             raise AssertionError(f"Unexpected 4th provider call to {req.full_url}")
 
@@ -797,10 +808,10 @@ class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.Tes
             "GEMINI_MAX_RETRIES": "1",
             "MAIN_REVIEWERS": "2",
             "EXTRA_PROVIDERS_MODE": "fallback",
-            "ENABLE_GITHUB_MODELS": "true",
-            "GH_TOKEN": "ghs_test_token",
             "GROQ_API_KEY": "gsk_test_token",
-            "OPENROUTER_API_KEY": "sk-or-unused-reserve",
+            "GROQ_MODEL": "openai/gpt-oss-120b",
+            "OPENROUTER_API_KEY": "sk-or-test_token",
+            "CEREBRAS_API_KEY": "csk-unused-reserve",
         }
         with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
             output_md, action_txt, _, _ = self._run_main_in_tempdir(
@@ -813,8 +824,8 @@ class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.Tes
         self.assertEqual(
             seen_urls,
             [
-                "https://models.github.ai/inference/chat/completions",
                 "https://api.groq.com/openai/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
             ],
         )
         self.assertEqual(action_txt, "request-changes")
@@ -824,9 +835,9 @@ class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.Tes
 
         extra_md = artifacts["review_output_extra_1.md"]
         self.assertIn("**Reviewer:** `Main Reviewer #2`", extra_md)
-        self.assertIn("**Source Provider:** `Groq`", extra_md)
-        self.assertIn("**AI Model:** `openai/gpt-oss-120b`", extra_md)
-        self.assertIn("**Fallback For:** `GitHub Models`", extra_md)
+        self.assertIn("**Source Provider:** `OpenRouter`", extra_md)
+        self.assertIn("**AI Model:** `qwen/qwen3-coder:free`", extra_md)
+        self.assertIn("**Fallback For:** `Groq`", extra_md)
 
     def test_two_main_reviewers_with_extra_providers_as_subagents(self):
         gemini_prompts: list[str] = []
@@ -835,15 +846,15 @@ class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.Tes
             gemini_prompts.append(contents)
             return "#### 📋 Issue Requirements Checklist\n- ✅ Implemented\n\n[APPROVED]"
 
-        gh_prompts: list[str] = []
+        groq_prompts: list[str] = []
 
         def fake_urlopen(req, timeout=60):
             payload = json.loads(req.data.decode("utf-8"))
             user_msg = payload["messages"][1]["content"]
-            if "api.groq.com" in req.full_url:
+            if "openrouter.ai" in req.full_url:
                 return _make_urlopen_response("Subagent found potential SQL injection at app.py:L1.")
-            if "models.github.ai" in req.full_url:
-                gh_prompts.append(user_msg)
+            if "api.groq.com" in req.full_url:
+                groq_prompts.append(user_msg)
                 return _make_urlopen_response("Verified SQL injection.\n\n[CHANGES_REQUESTED]")
             raise AssertionError(f"Unexpected call to {req.full_url}")
 
@@ -852,9 +863,8 @@ class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.Tes
             "GEMINI_MAX_RETRIES": "1",
             "MAIN_REVIEWERS": "2",
             "EXTRA_PROVIDERS_MODE": "subagents",
-            "ENABLE_GITHUB_MODELS": "true",
-            "GH_TOKEN": "ghs_test_token",
             "GROQ_API_KEY": "gsk_test_token",
+            "OPENROUTER_API_KEY": "sk-or-test_token",
         }
         with mock.patch.object(gemini_review.urllib.request, "urlopen", side_effect=fake_urlopen):
             output_md, action_txt, _, _ = self._run_main_in_tempdir(
@@ -867,9 +877,9 @@ class TestMultiReviewerSubagentsAndInlineComments(_MainRunnerMixin, unittest.Tes
         self.assertEqual(action_txt, "request-changes")
         self.assertIn("# Subagent Reviewer Reports", gemini_prompts[0])
         self.assertIn("Subagent found potential SQL injection at app.py:L1.", gemini_prompts[0])
-        self.assertIn("# Subagent Reviewer Reports", gh_prompts[0])
-        self.assertIn("**Subagents Consulted:** `openai/gpt-oss-120b via Groq`", output_md)
-        self.assertIn("**Subagents Consulted:** `openai/gpt-oss-120b via Groq`", artifacts["review_output_extra_1.md"])
+        self.assertIn("# Subagent Reviewer Reports", groq_prompts[0])
+        self.assertIn("**Subagents Consulted:** `qwen/qwen3-coder:free via OpenRouter`", output_md)
+        self.assertIn("**Subagents Consulted:** `qwen/qwen3-coder:free via OpenRouter`", artifacts["review_output_extra_1.md"])
 
     def test_inline_line_by_line_comments_annotated_extracted_and_attributed(self):
         diff_text = (

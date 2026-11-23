@@ -20,9 +20,7 @@ from google.genai import types
 MISSING_ISSUE_MARKER = "<!-- gemini-pr-reviewer:missing-issue -->"
 DEFAULT_PRIMARY_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite"
-DEFAULT_PROVIDER_ORDER = "gemini,github-models,groq,openrouter,cerebras,mistral,custom-openai"
-DEFAULT_GITHUB_MODELS_BASE_URL = "https://models.github.ai/inference"
-DEFAULT_GITHUB_MODELS_MODELS = "openai/gpt-4.1-mini"
+DEFAULT_PROVIDER_ORDER = "gemini,groq,openrouter,cerebras,mistral,custom-openai"
 DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_GROQ_MODELS = "openai/gpt-oss-120b,llama-3.3-70b-versatile"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -967,27 +965,6 @@ def build_provider_chain(
                 source_env.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODELS),
             )
         ),
-    )
-
-    gh_models_enabled = source_env.get("ENABLE_GITHUB_MODELS", "").strip().lower() in ("true", "1", "yes")
-    gh_models_key = (
-        (
-            source_env.get("GITHUB_MODELS_TOKEN")
-            or source_env.get("GH_TOKEN")
-            or source_env.get("GITHUB_TOKEN")
-            or ""
-        ).strip()
-        if gh_models_enabled
-        else ""
-    )
-    available["github-models"] = ProviderSpec(
-        provider_id="github-models",
-        display_name="GitHub Models",
-        kind="openai",
-        api_key=gh_models_key,
-        base_url=source_env.get("GITHUB_MODELS_BASE_URL", DEFAULT_GITHUB_MODELS_BASE_URL).strip()
-        or DEFAULT_GITHUB_MODELS_BASE_URL,
-        models=tuple(parse_model_list(source_env.get("GITHUB_MODELS_MODEL", ""), DEFAULT_GITHUB_MODELS_MODELS)),
     )
 
     preset_defs = (
@@ -2062,11 +2039,18 @@ def main():
     providers = build_provider_chain(openai_fallback=openai_fallback)
     if not providers:
         print(
-            "No AI review provider configured. Provide GEMINI_API_KEY, set ENABLE_GITHUB_MODELS=true "
-            "(with GH_TOKEN/GITHUB_TOKEN), or configure GROQ_API_KEY, OPENROUTER_API_KEY, "
-            "CEREBRAS_API_KEY, MISTRAL_API_KEY, or FALLBACK_OPENAI_*."
+            "No AI review provider configured. Provide GEMINI_API_KEY, or configure "
+            "GROQ_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY, MISTRAL_API_KEY, "
+            "or FALLBACK_OPENAI_*."
         )
-        sys.exit(1)
+        msg = (
+            "> [!WARNING]\n"
+            "> Automated AI review skipped: No AI review provider configured.\n"
+            "> Please configure `GEMINI_API_KEY` (or `GROQ_API_KEY`, `OPENROUTER_API_KEY`, "
+            "`CEREBRAS_API_KEY`, `MISTRAL_API_KEY`) in repository secrets."
+        )
+        write_review_outputs(msg, "comment")
+        return
 
     gemini_provider = next((p for p in providers if p.kind == "gemini"), None)
     api_key = gemini_provider.api_key if gemini_provider else ""

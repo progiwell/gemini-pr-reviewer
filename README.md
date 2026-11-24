@@ -158,9 +158,37 @@ The reviewer automatically detects linked issues from any of the following forma
 
 ---
 
-## 🔑 Setup API Key
+## 🔑 Setup: API Keys, Secrets & Repository Permissions
 
-1. Generate a free API key at [Google AI Studio](https://aistudio.google.com/).
-2. Add it to your repository secrets:
-   - Go to **Settings** > **Secrets and variables** > **Actions**.
-   - Create secret `GEMINI_API_KEY`.
+### 1. Generate Provider API Key(s)
+
+1. Generate a free Gemini API key at [Google AI Studio](https://aistudio.google.com/) (`GEMINI_API_KEY`).
+2. *(Optional)* To enable the built-in 2-reviewer default or free fallbacks, create keys for any additional providers you want (`GROQ_API_KEY`, `OPENROUTER_API_KEY`, `CEREBRAS_API_KEY`, `MISTRAL_API_KEY`).
+
+### 2. Where to Store Secrets (Organization vs. Personal & Public vs. Private)
+
+| Repository Setup | Recommended Secret Scope | GitHub UI Path | Notes |
+|---|---|---|---|
+| **Personal Account** (Public or Private) | **Repository secret** | **Repo Settings → Secrets and variables → Actions** | Works identically for public and private repos on all GitHub plans. |
+| **Organization — Public Repo** (Free, Team, or Enterprise) | **Organization secret** | **Org Settings → Secrets and variables → Actions** | Set **Repository access** to **All repositories** or **Selected repositories** so every public org repo inherits one shared secret. |
+| **Organization — Private Repo** (GitHub Free Org) | **Repository secret** | **Repo Settings → Secrets and variables → Actions** | On **GitHub Free for Organizations**, org-level secrets are **only exposed to public repositories**—private repos must define repo-level secrets. |
+| **Organization — Private Repo** (GitHub Team / Enterprise) | **Organization secret** | **Org Settings → Secrets and variables → Actions** | Org-level secrets can be shared with private and selected repositories. |
+
+> **Precedence & Reuse Tip:** A **repository secret** always overrides an **organization secret** with the same name. Once you add `GEMINI_API_KEY` (or `GROQ_API_KEY`) at the organization level, delete any duplicate repo-level secrets so you only have to rotate keys in one place.
+
+### 3. Enable Formal PR Approvals (`Allow GitHub Actions to create and approve pull requests`)
+
+By default, GitHub blocks `github-actions[bot]` from submitting formal `APPROVED` reviews (returning HTTP `422: GitHub Actions is not permitted to approve pull requests`). When blocked, this action automatically falls back to posting a neutral `COMMENTED` review containing `[APPROVED]` in the body.
+
+To let the reviewer submit native green **`APPROVED`** reviews:
+
+- **Personal / Single Repository:**
+  1. Go to **Repo Settings → Actions → General**.
+  2. Under **Workflow permissions**, check **Allow GitHub Actions to create and approve pull requests** and click **Save**.
+- **Organization Repository (2-step check):**
+  1. First enable it at the **Organization level**: **Org Settings → Actions → General → Workflow permissions → check "Allow GitHub Actions to create and approve pull requests" → Save**. *(If this is unchecked at the org level, the repo-level toggle is locked/blocked with HTTP `409`.)*
+  2. Then confirm the same checkbox is enabled under **Repo Settings → Actions → General → Workflow permissions** (if not inherited automatically).
+
+### 4. Note on Fork Pull Requests (Public Repositories)
+
+For security, GitHub Actions does not expose repository or organization secrets (`GEMINI_API_KEY`, etc.) to `pull_request` workflows triggered from **external forks** by default. Only pull requests opened from branches inside the repository receive configured secrets.

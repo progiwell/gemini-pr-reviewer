@@ -169,7 +169,8 @@ The reviewer automatically detects linked issues from any of the following forma
 
 | Repository Setup | Recommended Secret Scope | GitHub UI Path | Notes |
 |---|---|---|---|
-| **Personal Account** (Public or Private) | **Repository secret** | **Repo Settings → Secrets and variables → Actions** | Works identically for public and private repos on all GitHub plans. |
+| **Personal Account — Public Repo** | **Repository secret** | **Repo Settings → Secrets and variables → Actions** | Supported on all GitHub plans (external fork PRs do not receive secrets). |
+| **Personal Account — Private Repo** | **Repository secret** | **Repo Settings → Secrets and variables → Actions** | Supported on all GitHub plans; all collaborators with write access trigger reviews on in-repo branches. |
 | **Organization — Public Repo** (Free, Team, or Enterprise) | **Organization secret** | **Org Settings → Secrets and variables → Actions** | Set **Repository access** to **All repositories** or **Selected repositories** so every public org repo inherits one shared secret. |
 | **Organization — Private Repo** (GitHub Free Org) | **Repository secret** | **Repo Settings → Secrets and variables → Actions** | On **GitHub Free for Organizations**, org-level secrets are **only exposed to public repositories**—private repos must define repo-level secrets. |
 | **Organization — Private Repo** (GitHub Team / Enterprise) | **Organization secret** | **Org Settings → Secrets and variables → Actions** | Org-level secrets can be shared with private and selected repositories. |

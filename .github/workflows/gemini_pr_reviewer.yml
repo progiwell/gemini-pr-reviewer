@@ -27,4 +27,5 @@ jobs:
         uses: ./
         with:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          groq-api-key: ${{ secrets.GROQ_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}

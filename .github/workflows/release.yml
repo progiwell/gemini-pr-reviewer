@@ -54,7 +54,12 @@ jobs:
 
           BUMP="$BUMP_MODE"
           if [ "$BUMP" = "auto" ]; then
-            if git log "${LAST_TAG}..HEAD" --pretty=format:%s | grep -qE '^feat(\(.+\))?!?:'; then
+            if git rev-parse "$LAST_TAG" >/dev/null 2>&1; then
+              LOG_RANGE="${LAST_TAG}..HEAD"
+            else
+              LOG_RANGE="HEAD"
+            fi
+            if git log "$LOG_RANGE" --pretty=format:%s | grep -qE '^feat(\(.+\))?!?:'; then
               BUMP="minor"
             else
               BUMP="patch"

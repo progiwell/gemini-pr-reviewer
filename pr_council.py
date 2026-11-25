@@ -17,7 +17,8 @@ from datetime import datetime
 from google import genai
 from google.genai import types
 
-MISSING_ISSUE_MARKER = "<!-- gemini-pr-reviewer:missing-issue -->"
+MISSING_ISSUE_MARKER = "<!-- pr-council:missing-issue -->"
+LEGACY_MISSING_ISSUE_MARKER = "<!-- gemini-pr-reviewer:missing-issue -->"
 DEFAULT_PRIMARY_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite"
 DEFAULT_PROVIDER_ORDER = "gemini,groq,openrouter,cerebras,mistral,custom-openai"
@@ -474,7 +475,11 @@ def count_prior_missing_issue_reviews(reviews: list[dict]) -> int:
     count = 0
     for rev in reviews or []:
         body = (rev.get("body") or "") if isinstance(rev, dict) else ""
-        if MISSING_ISSUE_MARKER in body or "No Linked GitHub Issue Found" in body:
+        if (
+            MISSING_ISSUE_MARKER in body
+            or LEGACY_MISSING_ISSUE_MARKER in body
+            or "No Linked GitHub Issue Found" in body
+        ):
             count += 1
     return count
 
@@ -1065,7 +1070,7 @@ def attempt_openai_compatible_review(
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {cfg.api_key.strip()}",
-            "User-Agent": "gemini-pr-reviewer/1.2",
+            "User-Agent": "pr-council/1.3",
         },
         method="POST",
     )

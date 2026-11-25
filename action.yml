@@ -1,5 +1,5 @@
-name: 'Gemini PR Reviewer'
-description: 'Automated AI code review for GitHub pull requests with exponential backoff and multi-model fallback.'
+name: 'PR Council'
+description: 'Automated multi-provider AI code review council for GitHub pull requests with fallback, subagents, consensus, and inline comments.'
 branding:
   icon: 'code'
   color: 'blue'
@@ -176,7 +176,7 @@ runs:
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         BYPASS_KEYWORD: ${{ inputs.bypass-keyword }}
-      run: python ${{ github.action_path }}/gemini_review.py
+      run: python ${{ github.action_path }}/pr_council.py
 
     - name: Post Review Comment
       shell: bash

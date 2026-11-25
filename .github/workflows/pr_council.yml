@@ -1,11 +1,11 @@
-name: Gemini PR Reviewer
+name: PR Council
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
-  group: gemini-pr-review-${{ github.event.pull_request.number }}
+  group: pr-council-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Gemini AI Review
+      - name: PR Council Review
         uses: ./
         with:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}

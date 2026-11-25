@@ -1,24 +1,24 @@
-# 🤖 Gemini PR Reviewer
+# 🏛️ PR Council
 
-A robust, enterprise-grade GitHub Action for automated AI code reviews on Pull Requests powered by **Google Gemini via Google AI Studio**.
+A robust, enterprise-grade GitHub Action for automated multi-provider AI code reviews on Pull Requests (**Google Gemini**, **Groq**, **OpenRouter `:free`**, **Cerebras**, **Mistral**, and custom OpenAI-compatible endpoints).
 
-Includes **Strict Original Issue Verification**, a **3-tier multi-model fallback chain** (`gemini-3.8-flash` $\to$ `gemini-3.6-flash` $\to$ `gemini-3.5-flash-lite`), **bounded HTTP timeouts & socket-drop retries**, **smart diff exclusions**, and **file-aware Map-Reduce chunked reviews** for large PRs.
+Includes **2-Reviewer Default + Fallbacks/Subagents**, **Exact Line-by-Line Inline Comments**, **Strict Original Issue Verification**, **bounded HTTP timeouts & socket-drop retries**, **smart diff exclusions**, and **file-aware Map-Reduce chunked reviews** for large PRs.
 
 ---
 
 ## 🚀 Quick Start
 
-Add `.github/workflows/gemini_pr_reviewer.yml` to your repository. Omitting `primary-model` and `fallback-model` automatically inherits the recommended defaults from `progiwell/gemini-pr-reviewer@v1`:
+Add `.github/workflows/pr_council.yml` to your repository. Omitting `primary-model` and `fallback-model` automatically inherits the recommended defaults from `progiwell/pr-council@v1`:
 
 ```yaml
-name: Gemini PR Reviewer
+name: PR Council
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
-  group: gemini-pr-review-${{ github.event.pull_request.number }}
+  group: pr-council-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -36,15 +36,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Gemini AI Review
-        uses: progiwell/gemini-pr-reviewer@v1
+      - name: PR Council Review
+        uses: progiwell/pr-council@v1
         with:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
 ```
 
 ### Built-In Free AI Providers, 2-Reviewer Default & Line-by-Line Comments
 
-You can combine Google Gemini with built-in free AI provider presets (**GitHub Models**, **Groq**, **OpenRouter `:free`**, **Cerebras**, and **Mistral**) using simple inputs:
+You can combine Google Gemini with built-in free AI provider presets (**Groq**, **OpenRouter `:free`**, **Cerebras**, and **Mistral**) using simple inputs:
 
 - **`main-reviewers` (default `'2'`)**: Selects the first 2 working providers in `provider-order` as **Main Reviewer #1** and **Main Reviewer #2**, each posting an attributed review labeled with its reviewer slot, source provider, AI model, and any fallback/subagent provenance.
 - **`extra-providers-mode` (default `'fallback'`)**:
@@ -67,8 +67,8 @@ You can combine Google Gemini with built-in free AI provider presets (**GitHub M
         with:
           fetch-depth: 0
 
-      - name: Multi-Provider AI Review
-        uses: progiwell/gemini-pr-reviewer@v1
+      - name: PR Council Review
+        uses: progiwell/pr-council@v1
         with:
           main-reviewers: '2'              # Default: 2 independent main reviewers
           extra-providers-mode: 'fallback' # 'fallback' (default) or 'subagents'

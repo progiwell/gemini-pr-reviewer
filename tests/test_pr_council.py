@@ -50,7 +50,7 @@ def _install_genai_stub() -> None:
 
 _install_genai_stub()
 
-import gemini_review  # noqa: E402
+import pr_council as gemini_review  # noqa: E402
 
 
 def _make_file_patch(path: str, body_size: int = 120) -> str:

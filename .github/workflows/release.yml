@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    branches: [prod]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Semver bump type (auto detects from commits since last tag)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute Next Semver Tag
+        id: semver
+        env:
+          BUMP_MODE: ${{ inputs.bump || 'auto' }}
+        run: |
+          git fetch --tags --force
+          LAST_TAG=$(git tag -l 'v1.*.*' --sort=-v:refname | head -n 1)
+          if [ -z "$LAST_TAG" ]; then
+            LAST_TAG="v1.0.0"
+          fi
+          echo "Latest tag: $LAST_TAG"
+
+          # Skip if HEAD is already tagged with a semver release
+          if git tag --points-at HEAD | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            EXISTING=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+            echo "HEAD already tagged as $EXISTING; skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$EXISTING" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION="${LAST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          BUMP="$BUMP_MODE"
+          if [ "$BUMP" = "auto" ]; then
+            if git log "${LAST_TAG}..HEAD" --pretty=format:%s | grep -qE '^feat(\(.+\))?!?:'; then
+              BUMP="minor"
+            else
+              BUMP="patch"
+            fi
+          fi
+
+          if [ "$BUMP" = "minor" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEXT_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "Next tag: $NEXT_TAG (bump=$BUMP)"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and Create GitHub Release
+        if: steps.semver.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_TAG: ${{ steps.semver.outputs.tag }}
+          PREV_TAG: ${{ steps.semver.outputs.prev_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$NEXT_TAG" -m "Release $NEXT_TAG"
+          git push origin "$NEXT_TAG"
+
+          git tag -fa v1 -m "Update floating v1 tag to $NEXT_TAG"
+          git push origin v1 --force
+
+          NOTES_FLAG=()
+          if [ -n "$PREV_TAG" ] && git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            NOTES_FLAG=(--notes-start-tag "$PREV_TAG")
+          fi
+
+          gh release create "$NEXT_TAG" \
+            --title "$NEXT_TAG" \
+            --generate-notes \
+            "${NOTES_FLAG[@]}"
